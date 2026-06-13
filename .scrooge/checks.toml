@@ -1,0 +1,3 @@
+# Per-language check commands run by `scrooge check` after each task.
+# Edit freely (agents may too). Remove a key to skip that stage.
+
