@@ -77,11 +77,13 @@ for m in re.finditer(r'"prompt_length_type":"(\w+)"', s):
 
 
 def keep_field(k):
-    if k.startswith(("canonical_eval_token_counts.", "model_creators.")):
+    if k.startswith(("canonical_eval_token_counts.", "representative_query_token_counts.", "model_creators.")):
         return False
     if k.startswith("multilingual_aa.") and k != "multilingual_aa.average.score":
         return False
     if k.startswith("omniscience_breakdown.") and not k.startswith("omniscience_breakdown.total."):
+        return False
+    if k.startswith("briefcase_breakdown.") and k != "briefcase_breakdown.elo":
         return False
     return True
 
