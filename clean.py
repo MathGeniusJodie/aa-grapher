@@ -14,6 +14,77 @@ s = open("providers").read()
 decoder = json.JSONDecoder()
 
 
+# --- EQBench 3 results (eqbench3_chartdata.js) ---------------------------------
+# The chart file is `const chartData = { <model-id>: {...} };`. Each entry's
+# `absoluteRadar` holds the per-dimension scores we surface as `eqbench3_*`.
+def load_eqbench(path="eqbench3_chartdata.js"):
+    try:
+        text = open(path).read()
+    except FileNotFoundError:
+        return {}
+    obj = text[text.index("{"): text.rstrip().rstrip(";").rindex("}") + 1]
+    chart = json.loads(obj)
+    out = {}
+    for key, entry in chart.items():
+        ar = (entry or {}).get("absoluteRadar") or {}
+        labels, values = ar.get("labels"), ar.get("values")
+        if not labels or not values or len(labels) != len(values):
+            continue
+        out[key] = {f"eqbench3_{lab}": v for lab, v in zip(labels, values)
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    return out
+
+
+EQBENCH = load_eqbench()
+
+# EQBench model ids use a different naming convention than Artificial Analysis,
+# so match on a normalized form. DROP removes serving/format descriptors that
+# only one side carries; size tokens (e.g. "120b") are kept so variants don't
+# collide. ALIASES cover genuine renames / reorderings the normalizer can't see.
+_EQ_DROP = {"instruct", "it", "beta", "preview", "latest", "chat", "free",
+            "base", "hf", "reasoning", "thinking", "exp", "turbo"}
+
+
+def _eq_norm(x):
+    if not x:
+        return ""
+    x = x.split("/")[-1].lower()
+    x = re.sub(r"\(.*?\)", "", x)            # parenthetical effort/variant notes
+    x = re.sub(r"\d{4}-\d{2}-\d{2}", "", x)  # ISO dates
+    x = re.sub(r"\d{8}", "", x)              # yyyymmdd dates
+    return "".join(p for p in re.split(r"[^a-z0-9]+", x) if p and p not in _EQ_DROP)
+
+
+EQ_ALIASES = {
+    "llama4scout": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+    "llama4maverick": "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
+    "llamanemotronultra": "nvidia/llama-3.1-nemotron-ultra-253b-v1:free",
+    "gpt4o": "chatgpt-4o-latest-2025-04-25",
+    "gpt5": "gpt-5-chat-latest-2025-08-07",
+    "claude45sonnet": "claude-sonnet-4.5", "claudesonnet45": "claude-sonnet-4.5",
+    "claude4sonnet": "claude-sonnet-4", "claudesonnet4": "claude-sonnet-4",
+    "claude4opus": "claude-opus-4", "claudeopus4": "claude-opus-4",
+    "mistrallarge2": "mistralai/Mistral-Large-Instruct-2411",
+    "mistralsmall3": "mistralai/Mistral-Small-24B-Instruct-2501",
+    "mistralsmall31": "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+    "mistralsmall32": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+    "grok420": "grok-4.20-beta", "grok4200309": "grok-4.20-beta",
+}
+_EQ_BY_NORM = {_eq_norm(k): k for k in EQBENCH}
+
+
+def eqbench_for(model):
+    """Return the eqbench3_* dict for an AA model dict, or {} if no match."""
+    for attr in ("slug", "name", "short_name"):
+        n = _eq_norm(model.get(attr))
+        if not n:
+            continue
+        key = EQ_ALIASES.get(n) or _EQ_BY_NORM.get(n)
+        if key and key in EQBENCH:
+            return EQBENCH[key]
+    return {}
+
+
 def enclosing_object(i):
     """Parse the JSON object whose body contains position i."""
     depth = 0
@@ -76,7 +147,23 @@ for m in re.finditer(r'"prompt_length_type":"(\w+)"', s):
             host_data[o["model_id"]][f"{f}_{plen}_prompt"].append(v)
 
 
+# Outdated/superseded/saturated benchmarks to drop from the export.
+# (All `lab_claimed_*` fields are dropped separately in keep_field.)
+EXCLUDED_FIELDS = {
+    "aime",          # superseded by aime25 and newer math evals
+    "aime25",        # saturated; rolled into math_index
+    "math_500",      # saturated
+    "mmlu_pro",      # saturated
+    "livecodebench", # superseded by newer coding evals
+    "humaneval",     # saturated
+}
+
+
 def keep_field(k):
+    if k in EXCLUDED_FIELDS:
+        return False
+    if k.startswith("lab_claimed_"):
+        return False
     if k.startswith(("canonical_eval_token_counts.", "representative_query_token_counts.", "model_creators.")):
         return False
     if k.startswith("multilingual_aa.") and k != "multilingual_aa.average.score":
@@ -114,6 +201,15 @@ for mid, m in models.items():
     tout = tc.get("output_tokens")
     if None not in (pin, pout, tin, tout) and (pin or pout):
         row["intelligence_index_run_cost"] = (tin * pin + tout * pout) / 1e6
+    # Use `estimated_*` values as a fallback for the metric they estimate, then
+    # drop the estimated field itself (it's merged into the real one).
+    for k in [k for k in row if k.startswith("estimated_")]:
+        base = k[len("estimated_"):]
+        cur = row.get(base)
+        if not isinstance(cur, (int, float)) or isinstance(cur, bool):
+            row[base] = row[k]
+        del row[k]
+    row.update(eqbench_for(m))
     row["name"] = m.get("short_name") or m.get("name")
     row["creator"] = (m.get("model_creators") or {}).get("name", "")
     row["open_weights"] = bool(m.get("is_open_weights"))
@@ -142,6 +238,8 @@ def default_scale(field):
 
 def pretty_name(field):
     """Convert snake_case / dot.separated field names to Title Case words."""
+    if field.startswith("eqbench3_"):
+        return "EQB3 " + pretty_name(field[len("eqbench3_"):])
     return " ".join(w.upper() if w in ("elo", "aime", "aq", "ttfc", "ci", "p25", "p50", "p75", "p95", "p5")
                    else w.capitalize()
                    for w in re.split(r"[_.]", field))
