@@ -5,6 +5,7 @@ The payload holds ~900 model×host entries. Benchmark scores live on the nested
 "model" object; pricing and speed live on the host entry. We aggregate hosts
 per model using the median.
 """
+import csv
 import json
 import re
 from collections import Counter, defaultdict
@@ -82,6 +83,127 @@ def eqbench_for(model):
         key = EQ_ALIASES.get(n) or _EQ_BY_NORM.get(n)
         if key and key in EQBENCH:
             return EQBENCH[key]
+    return {}
+
+
+# --- LiveBench results (table_<date>.csv) -------------------------------------
+# The CSV is one row per LiveBench model id with a column per benchmark task.
+# Each numeric cell is surfaced as a `livebench_<task>` field.
+def load_livebench_categories(path="categories_2026_01_08.json"):
+    """Map category name -> member column list, for aggregate scores."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+LB_CATEGORIES = load_livebench_categories()
+
+
+def load_livebench(path="table_2026_01_08.csv"):
+    try:
+        f = open(path, newline="")
+    except FileNotFoundError:
+        return {}
+    out = {}
+    with f:
+        for r in csv.DictReader(f):
+            mid = r.get("model")
+            if not mid:
+                continue
+            scores = {}
+            for col, val in r.items():
+                if col == "model":
+                    continue
+                try:
+                    scores[f"livebench_{col}"] = float(val)
+                except (TypeError, ValueError):
+                    continue
+            # Aggregate category scores: average the member columns present.
+            for cat, members in LB_CATEGORIES.items():
+                vals = [scores[f"livebench_{m}"] for m in members
+                        if f"livebench_{m}" in scores]
+                if vals:
+                    cid = "livebench_" + re.sub(r"\W+", "_", cat.strip().lower())
+                    scores[cid] = sum(vals) / len(vals)
+            if scores:
+                out[mid] = scores
+    return out
+
+
+LIVEBENCH = load_livebench()
+
+# LiveBench ids drop reasoning/effort/serving descriptors and order size tokens
+# differently from AA, so match on a normalized form (cf. `_eq_norm`). LB_ALIASES
+# cover reorderings (AA writes "4.5 Haiku", LiveBench "haiku-4-5") and stray
+# release dates the date regexes don't catch.
+_LB_DROP = {"base", "thinking", "reasoning", "nonreasoning", "nothinking",
+            "high", "low", "medium", "xhigh", "max", "effort", "highthinking",
+            "lowthinking", "preview", "exp", "auto", "32k", "64k", "16k",
+            "instruct", "it", "chat", "latest", "beta", "free", "hf",
+            "minimal", "instant", "non", "fast"}
+
+
+def _lb_norm(x, is_slug=False):
+    if not x:
+        return ""
+    x = x.split("/")[-1].lower().split(",")[0]
+    if is_slug and "_" in x:           # AA slugs are "<provider>_<model>"
+        x = x.split("_", 1)[1]
+    x = re.sub(r"\(.*?\)", "", x)
+    x = re.sub(r"\d{4}-\d{2}-\d{2}", "", x)      # ISO date
+    x = re.sub(r"\d{2}-\d{4}", "", x)            # mm-yyyy
+    x = re.sub(r"(?<!\d)\d{2}-\d{2}(?!\d)", "", x)  # mm-dd
+    x = re.sub(r"\d{8}", "", x)                  # yyyymmdd
+    return "".join(p for p in re.split(r"[^a-z0-9]+", x) if p and p not in _LB_DROP)
+
+
+# `_lb_norm` drops effort descriptors (xhigh/medium/...), so distinct LiveBench
+# rows like "gpt-5.5-xhigh" and "gpt-5.5-medium" collapse to one norm and an AA
+# model would match an arbitrary effort variant. `_lb_effort` recovers the effort
+# level (kept even when in parens, e.g. AA's "GPT-5.5 (xhigh)") so we can match
+# effort-aware first, then fall back to the bare norm.
+_LB_EFFORTS = ("xhigh", "xlow", "high", "medium", "low", "minimal", "max")
+
+
+def _lb_effort(x):
+    if not x:
+        return ""
+    toks = set(re.split(r"[^a-z0-9]+", x.lower()))
+    for e in _LB_EFFORTS:
+        if e in toks:
+            return e
+    return ""
+
+
+# keyed by the AA-side normalized form, value is the LiveBench-side form
+LB_ALIASES = {
+    "claude45haiku": "claudehaiku45", "claude45sonnet": "claudesonnet45",
+    "grok4": "grok40709", "grokcode1": "grokcode10825",
+}
+_LB_BY_NORM = {_lb_norm(k): k for k in LIVEBENCH}
+_LB_BY_NORM_EFFORT = {(_lb_norm(k), _lb_effort(k)): k for k in LIVEBENCH}
+
+
+def livebench_for(model):
+    """Return the livebench_* dict for an AA model dict, or {} if no match."""
+    attrs = (("slug", True), ("short_name", False), ("name", False))
+    norms = []
+    for attr, is_slug in attrs:
+        raw = model.get(attr)
+        n = _lb_norm(raw, is_slug=is_slug)
+        if n:
+            norms.append((LB_ALIASES.get(n, n), _lb_effort(raw)))
+    # Prefer an exact effort match from *any* attr before falling back to the
+    # bare norm, so a no-effort slug never grabs the wrong variant's row when a
+    # later attr (e.g. name "GPT-5.5 (xhigh)") carries the effort level.
+    for n, e in norms:
+        if e and (key := _LB_BY_NORM_EFFORT.get((n, e))):
+            return LIVEBENCH[key]
+    for n, _ in norms:
+        if key := _LB_BY_NORM.get(n):
+            return LIVEBENCH[key]
     return {}
 
 
@@ -210,6 +332,7 @@ for mid, m in models.items():
             row[base] = row[k]
         del row[k]
     row.update(eqbench_for(m))
+    row.update(livebench_for(m))
     row["name"] = m.get("short_name") or m.get("name")
     row["creator"] = (m.get("model_creators") or {}).get("name", "")
     row["open_weights"] = bool(m.get("is_open_weights"))
@@ -240,6 +363,8 @@ def pretty_name(field):
     """Convert snake_case / dot.separated field names to Title Case words."""
     if field.startswith("eqbench3_"):
         return "EQB3 " + pretty_name(field[len("eqbench3_"):])
+    if field.startswith("livebench_"):
+        return "LiveBench " + pretty_name(field[len("livebench_"):])
     return " ".join(w.upper() if w in ("elo", "aime", "aq", "ttfc", "ci", "p25", "p50", "p75", "p95", "p5")
                    else w.capitalize()
                    for w in re.split(r"[_.]", field))
