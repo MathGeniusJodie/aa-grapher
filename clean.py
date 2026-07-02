@@ -8,10 +8,39 @@ per model using the median.
 import csv
 import json
 import re
+import sys
+import urllib.request
 from collections import Counter, defaultdict
 from statistics import median
 
-s = open("providers").read()
+PROVIDERS_URL = "https://artificialanalysis.ai/leaderboards/providers"
+
+
+def fetch_providers(path="providers"):
+    """Download the RSC flight payload and cache it in `path`.
+
+    Pass --cached to reuse the existing file instead of re-downloading.
+    """
+    if "--cached" in sys.argv:
+        try:
+            return open(path).read()
+        except FileNotFoundError:
+            pass
+    req = urllib.request.Request(PROVIDERS_URL, headers={
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+                      " (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+        # Next.js returns the raw flight payload (what this script parses)
+        # instead of the HTML shell when this header is set.
+        "RSC": "1",
+    })
+    with urllib.request.urlopen(req) as resp:
+        text = resp.read().decode()
+    with open(path, "w") as f:
+        f.write(text)
+    return text
+
+
+s = fetch_providers()
 decoder = json.JSONDecoder()
 
 
