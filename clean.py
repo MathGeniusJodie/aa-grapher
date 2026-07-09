@@ -255,116 +255,86 @@ def enclosing_object(i):
         return None
 
 
-# Host entries are the objects containing blended price keys.
-HOST_FIELDS = [
-    "price_1m_blended_0_3_1", "price_1m_blended_7_2_1", "price_1m_blended_0_1_1",
-    "price_1m_blended_100_1_1", "price_1m_blended_0_100_1",
-    "price_1m_input_tokens", "price_1m_output_tokens",
-    "median_output_speed", "median_time_to_first_chunk", "median_end_to_end_response_time",
-]
-models = {}
-host_data = defaultdict(lambda: defaultdict(list))
-for m in re.finditer(r'"price_1m_blended_0_3_1"', s):
-    o = enclosing_object(m.start())
-    if not isinstance(o, dict):
-        continue
-    model = o.get("model")
-    if not isinstance(model, dict) or "id" not in model:
-        continue
-    mid = model["id"]
-    if mid not in models or len(model) > len(models[mid]):
-        models[mid] = model
-    for f in HOST_FIELDS:
-        v = o.get(f)
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            host_data[mid][f].append(v)
-    ts = o.get("timescaleData") or {}
-    for f in ("median_output_speed", "median_time_to_first_chunk", "median_end_to_end_response_time"):
-        v = ts.get(f)
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            host_data[mid][f].append(v)
+# The payload holds one entry per model×host. Each entry has a nested `model`
+# (benchmark scores, keyed by `slug`), plus `pricing`, `performance` and
+# `features` sub-objects that vary by host. We aggregate hosts per model slug
+# using the median. `label` is the display name; there is no separate id.
+def snake(k):
+    """camelCase leaf key -> snake_case (lowercased, digits kept attached)."""
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", k).lower()
 
 
-# Per-prompt-length performance rows live outside the host entries; collect
-# end-to-end / TTFC stats per model and prompt length ("medium", "long", "100k").
-for m in re.finditer(r'"prompt_length_type":"(\w+)"', s):
-    o = enclosing_object(m.start())
-    if not isinstance(o, dict) or "model_id" not in o:
-        continue
-    plen = m.group(1)
-    for f in ("median_time_to_first_chunk", "median_end_to_end_response_time", "median_output_speed"):
-        v = o.get(f)
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            host_data[o["model_id"]][f"{f}_{plen}_prompt"].append(v)
-
-
-# Outdated/superseded/saturated benchmarks to drop from the export.
-# (All `lab_claimed_*` fields are dropped separately in keep_field.)
-EXCLUDED_FIELDS = {
-    "aime",          # superseded by aime25 and newer math evals
-    "aime25",        # saturated; rolled into math_index
-    "math_500",      # saturated
-    "mmlu_pro",      # saturated
-    "livecodebench", # superseded by newer coding evals
-    "humaneval",     # saturated
+# Renames for fields whose plain snake form would misfire the direction/scale
+# heuristics (which key off substrings like "tokens") or read awkwardly.
+# `*_seconds` suffixes are stripped generically below.
+# Order matters: `price1m_` is normalised before the blended field is shortened.
+FIELD_RENAME = {
+    "output_tokens_per_second": "output_speed",   # a speed (max), not a price
+    "time_to_first_token": "time_to_first_chunk",
+    "price1m_": "price_1m_",
+    "price_1m_blended7_to2_to1": "price_1m_blended",
 }
 
 
-def keep_field(k):
-    if k in EXCLUDED_FIELDS:
-        return False
-    if k.startswith("lab_claimed_"):
-        return False
-    if k.startswith(("canonical_eval_token_counts.", "representative_query_token_counts.", "model_creators.")):
-        return False
-    if k.startswith("multilingual_aa.") and k != "multilingual_aa.average.score":
-        return False
-    if k.startswith("omniscience_breakdown.") and not k.startswith("omniscience_breakdown.total."):
-        return False
-    if k.startswith("briefcase_breakdown.") and k != "briefcase_breakdown.elo":
-        return False
-    return True
+def field_name(dotted):
+    """Snake-case a flattened dotted path and apply the renames above."""
+    name = "_".join(snake(part) for part in dotted.split("."))
+    name = re.sub(r"_seconds$", "", name)
+    for a, b in FIELD_RENAME.items():
+        name = name.replace(a, b)
+    return name
 
 
 def flatten(obj, prefix=""):
+    """Flatten numeric leaves to snake_case field names via `field_name`."""
     out = {}
     for k, v in obj.items():
         key = f"{prefix}{k}"
         if isinstance(v, (int, float)) and not isinstance(v, bool):
-            out[key] = v
+            out[field_name(key)] = v
         elif isinstance(v, dict):
             out.update(flatten(v, f"{key}."))
     return out
 
 
+# Benchmark scores live on `model` and are identical across a model's hosts;
+# per-host `pricing`/`performance`/`features` are aggregated by median.
+HOST_SECTIONS = ("pricing", "performance", "features")
+models = {}          # slug -> model dict (with `name` injected for matching)
+labels = {}          # slug -> display label
+host_data = defaultdict(lambda: defaultdict(list))
+for hit in re.finditer(r'"hostApiId":', s):
+    o = enclosing_object(hit.start())
+    if not isinstance(o, dict):
+        continue
+    model = o.get("model")
+    if not isinstance(model, dict) or not model.get("slug"):
+        continue
+    slug = model["slug"]
+    label = o.get("label")
+    # eqbench/livebench matchers look at slug/name/short_name; the payload only
+    # carries slug, so surface the display label under both name attributes.
+    model = {**model, "name": label, "short_name": label}
+    if slug not in models or len(model) > len(models[slug]):
+        models[slug] = model
+    if label and slug not in labels:
+        labels[slug] = label
+    for section in HOST_SECTIONS:
+        for f, v in flatten(o.get(section) or {}).items():
+            host_data[slug][f].append(v)
+
+
 rows = []
-for mid, m in models.items():
-    row = {k: v for k, v in flatten(m).items() if keep_field(k)}
-    for f, vals in host_data[mid].items():
+for slug, m in models.items():
+    row = flatten(m)
+    for f, vals in host_data[slug].items():
         row[f] = median(vals)
-    row["num_hosts"] = len(host_data[mid].get("price_1m_blended_0_3_1", []))
-    # USD cost to run the full intelligence-index eval suite, from its token
-    # counts and the model's (median across hosts) per-1M-token prices
-    tc = m.get("intelligence_index_token_counts") or {}
-    pin = row.get("price_1m_input_tokens")
-    pout = row.get("price_1m_output_tokens")
-    tin = tc.get("input") or tc.get("input_tokens")
-    tout = tc.get("output_tokens")
-    if None not in (pin, pout, tin, tout) and (pin or pout):
-        row["intelligence_index_run_cost"] = (tin * pin + tout * pout) / 1e6
-    # Use `estimated_*` values as a fallback for the metric they estimate, then
-    # drop the estimated field itself (it's merged into the real one).
-    for k in [k for k in row if k.startswith("estimated_")]:
-        base = k[len("estimated_"):]
-        cur = row.get(base)
-        if not isinstance(cur, (int, float)) or isinstance(cur, bool):
-            row[base] = row[k]
-        del row[k]
+    row["num_hosts"] = len(host_data[slug].get("price_1m_blended", []))
     row.update(eqbench_for(m))
     row.update(livebench_for(m))
-    row["name"] = m.get("short_name") or m.get("name")
-    row["creator"] = (m.get("model_creators") or {}).get("name", "")
-    row["open_weights"] = bool(m.get("is_open_weights"))
+    row["name"] = labels.get(slug) or slug
+    row["creator"] = (m.get("creator") or {}).get("name", "")
+    row["open_weights"] = bool(m.get("isOpenWeights"))
     rows.append(row)
 
 counts = Counter(k for r in rows for k in r if k not in ("name", "creator", "open_weights"))
