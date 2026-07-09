@@ -2,7 +2,9 @@
 /accounts.log
 /ledger.json
 /providers
+/model_pages
 /eqbench3_chartdata.js
+/eqbench3.js
 /table_2026_01_08.csv
 /categories_2026_01_08.json
 /__pycache__

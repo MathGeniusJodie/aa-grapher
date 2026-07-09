@@ -7,13 +7,30 @@ per model using the median.
 """
 import csv
 import json
+import os
 import re
 import sys
+import time
 import urllib.request
 from collections import Counter, defaultdict
 from statistics import median
 
 PROVIDERS_URL = "https://artificialanalysis.ai/leaderboards/providers"
+MODEL_PAGE_URL = "https://artificialanalysis.ai/models/{slug}"
+MODEL_PAGE_CACHE_DIR = "model_pages"
+MODEL_PAGE_FETCH_DELAY = 20.0  # seconds to wait after each live model-page fetch
+
+USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+              " (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+
+def _fetch_rsc(url):
+    """GET a Next.js RSC flight payload (the raw data a page hydrates from)."""
+    # The RSC header makes Next.js return that raw payload instead of the HTML
+    # shell, which is what the rest of this script parses.
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "RSC": "1"})
+    with urllib.request.urlopen(req) as resp:
+        return resp.read().decode()
 
 
 def fetch_providers(path="providers"):
@@ -26,18 +43,50 @@ def fetch_providers(path="providers"):
             return open(path).read()
         except FileNotFoundError:
             pass
-    req = urllib.request.Request(PROVIDERS_URL, headers={
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-                      " (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-        # Next.js returns the raw flight payload (what this script parses)
-        # instead of the HTML shell when this header is set.
-        "RSC": "1",
-    })
-    with urllib.request.urlopen(req) as resp:
-        text = resp.read().decode()
+    text = _fetch_rsc(PROVIDERS_URL)
     with open(path, "w") as f:
         f.write(text)
     return text
+
+
+def fetch_model_page(slug):
+    """Return a model's own page payload, fetching once and caching forever after.
+
+    Individual model pages carry fields the bulk `providers` listing above has
+    dropped (Coding/Agentic Index, parameter count, legacy price ratios,
+    per-prompt-type breakdowns...). Fetching one per model would hit AA's
+    server far harder than the single bulk request above, so callers only ask
+    for a handful of slugs at a time; anything already cached on disk is
+    reused without a network call, so add more later by dropping a page at
+    `model_pages/<slug>` yourself.
+    """
+    os.makedirs(MODEL_PAGE_CACHE_DIR, exist_ok=True)
+    path = os.path.join(MODEL_PAGE_CACHE_DIR, slug)
+    if os.path.exists(path):
+        return open(path).read()
+    try:
+        text = _fetch_rsc(MODEL_PAGE_URL.format(slug=slug))
+    except Exception as e:
+        print(f"  ! couldn't fetch model page for {slug}: {e}", file=sys.stderr)
+        return None
+    with open(path, "w") as f:
+        f.write(text)
+    time.sleep(MODEL_PAGE_FETCH_DELAY)
+    return text
+
+
+# `--fetch-model <slug> [<slug> ...]` just seeds the model_pages/ cache (for
+# manually growing the enriched set) and exits — it never touches the bulk
+# `providers` listing, unlike a normal run.
+if "--fetch-model" in sys.argv:
+    slugs = sys.argv[sys.argv.index("--fetch-model") + 1:]
+    if not slugs:
+        sys.exit("usage: clean.py --fetch-model <slug> [<slug> ...]")
+    for slug in slugs:
+        print(f"fetching {slug}...")
+        if fetch_model_page(slug):
+            print(f"  cached to {MODEL_PAGE_CACHE_DIR}/{slug}")
+    sys.exit(0)
 
 
 s = fetch_providers()
@@ -236,12 +285,12 @@ def livebench_for(model):
     return {}
 
 
-def enclosing_object(i):
-    """Parse the JSON object whose body contains position i."""
+def enclosing_object(text, i):
+    """Parse the JSON object whose body contains position i in text."""
     depth = 0
     j = i
     while j > 0:
-        c = s[j]
+        c = text[j]
         if c == "}":
             depth += 1
         elif c == "{":
@@ -250,7 +299,7 @@ def enclosing_object(i):
             depth -= 1
         j -= 1
     try:
-        return decoder.raw_decode(s, j)[0]
+        return decoder.raw_decode(text, j)[0]
     except ValueError:
         return None
 
@@ -273,6 +322,12 @@ FIELD_RENAME = {
     "time_to_first_token": "time_to_first_chunk",
     "price1m_": "price_1m_",
     "price_1m_blended7_to2_to1": "price_1m_blended",
+    # The bulk `providers` listing and a model's own page spell these
+    # identically-valued fields differently; collapse onto the providers name
+    # so `row.setdefault` treats them as the same field instead of two.
+    "it_bench_sre": "itbench_sre",
+    "harvey_lab_all_pass": "harvey_lab",
+    "automation_bench_partial_score": "automation_bench",
 }
 
 
@@ -297,6 +352,29 @@ def flatten(obj, prefix=""):
     return out
 
 
+# These nested objects on a model page duplicate `performanceByPromptType`'s
+# "long" bucket value-for-value (verified across every enriched model so far),
+# so skip them rather than add redundant fields for the same numbers.
+MODEL_PAGE_DUPLICATE_KEYS = {"timescaleData", "endToEndResponseTime", "timeToFirstAnswerToken"}
+
+
+def model_page_fields(slug, text):
+    """Flatten the richest `"slug":"<slug>"` object found on a model's own page.
+
+    The same slug shows up in several shallow stub objects too (e.g. related-
+    model links), so keep whichever match has the most keys.
+    """
+    best = None
+    for m in re.finditer(rf'"slug":"{re.escape(slug)}"', text):
+        o = enclosing_object(text, m.start())
+        if isinstance(o, dict) and (best is None or len(o) > len(best)):
+            best = o
+    if not best:
+        return {}
+    trimmed = {k: v for k, v in best.items() if k not in MODEL_PAGE_DUPLICATE_KEYS}
+    return flatten(trimmed)
+
+
 # Benchmark scores live on `model` and are identical across a model's hosts;
 # per-host `pricing`/`performance`/`features` are aggregated by median.
 HOST_SECTIONS = ("pricing", "performance", "features")
@@ -304,7 +382,7 @@ models = {}          # slug -> model dict (with `name` injected for matching)
 labels = {}          # slug -> display label
 host_data = defaultdict(lambda: defaultdict(list))
 for hit in re.finditer(r'"hostApiId":', s):
-    o = enclosing_object(hit.start())
+    o = enclosing_object(s, hit.start())
     if not isinstance(o, dict):
         continue
     model = o.get("model")
@@ -325,6 +403,7 @@ for hit in re.finditer(r'"hostApiId":', s):
 
 
 rows = []
+row_slugs = []
 for slug, m in models.items():
     row = flatten(m)
     for f, vals in host_data[slug].items():
@@ -336,6 +415,55 @@ for slug, m in models.items():
     row["creator"] = (m.get("creator") or {}).get("name", "")
     row["open_weights"] = bool(m.get("isOpenWeights"))
     rows.append(row)
+    row_slugs.append(slug)
+
+
+# --- Enrich a handful of models with their individual model-page payload ------
+# Auto-fetch only the models most people actually look at (top TOP_N by
+# Intelligence Index, plus the price/intelligence Pareto frontier); everything
+# else stays on the bulk fields above unless its page is already cached (see
+# `fetch_model_page`). Fields already set from the bulk listing win on overlap
+# since they're aggregated across all of a model's hosts.
+TOP_N = None  # None = no cap, enrich every scored model
+
+
+def pareto_frontier(items, cost_key, quality_key):
+    """(slug, row) pairs on the min-cost/max-quality skyline."""
+    frontier = []
+    best_quality = float("-inf")
+    for slug, row in sorted(items, key=lambda t: t[1][cost_key]):
+        if row[quality_key] > best_quality:
+            frontier.append(slug)
+            best_quality = row[quality_key]
+    return frontier
+
+
+scored = [(slug, row) for slug, row in zip(row_slugs, rows) if "intelligence_index" in row]
+ranked = sorted(scored, key=lambda t: -t[1]["intelligence_index"])
+top_n = {slug for slug, _ in (ranked if TOP_N is None else ranked[:TOP_N])}
+priced = [(slug, row) for slug, row in scored if "price_1m_blended" in row]
+pareto = set(pareto_frontier(priced, "price_1m_blended", "intelligence_index"))
+priority_slugs = top_n | pareto
+
+enriched = 0
+stopped_early = False
+for slug, row in zip(row_slugs, rows):
+    cached = os.path.exists(os.path.join(MODEL_PAGE_CACHE_DIR, slug))
+    if slug not in priority_slugs and not cached:
+        continue
+    text = fetch_model_page(slug)
+    if text is None:
+        # A live fetch failed; stop rather than retry or push on to the next
+        # model (`fetch_model_page` already printed the underlying error).
+        print(f"stopping enrichment: fetch failed for {slug}, not retrying", file=sys.stderr)
+        stopped_early = True
+        break
+    for k, v in model_page_fields(slug, text).items():
+        row.setdefault(k, v)
+    enriched += 1
+status = "stopped early" if stopped_early else "done"
+print(f"enriched {enriched} models from individual model pages ({status}; "
+      f"{len(top_n)} top by intelligence, {len(pareto)} price/intelligence pareto)")
 
 counts = Counter(k for r in rows for k in r if k not in ("name", "creator", "open_weights"))
 fields = sorted(counts)
