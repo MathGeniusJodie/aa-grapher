@@ -312,8 +312,10 @@ def _lb_norm(x, is_slug=False):
 # `_lb_norm` drops effort descriptors (xhigh/medium/...), so distinct LiveBench
 # rows like "gpt-5.5-xhigh" and "gpt-5.5-medium" collapse to one norm and an AA
 # model would match an arbitrary effort variant. `_lb_effort` recovers the effort
-# level (kept even when in parens, e.g. AA's "GPT-5.5 (xhigh)") so we can match
-# effort-aware first, then fall back to the bare norm.
+# level (kept even when in parens, e.g. AA's "GPT-5.5 (xhigh)") so scores only
+# attach to the variant actually benchmarked. "none" marks non-reasoning
+# variants, which must never inherit a reasoning run's score (AA writes
+# "(Non-reasoning, high)": that "high" is not a thinking level).
 _LB_EFFORTS = ("xhigh", "xlow", "high", "medium", "low", "minimal", "max")
 
 
@@ -321,16 +323,45 @@ def _lb_effort(x):
     if not x:
         return ""
     toks = set(re.split(r"[^a-z0-9]+", x.lower()))
+    if "nonreasoning" in toks or "nothinking" in toks or {"non", "reasoning"} <= toks:
+        return "none"
     for e in _LB_EFFORTS:
         if e in toks:
             return e
     return ""
 
 
-# When an AA model carries no effort level but the source scored several
-# effort variants, fall back to the variant people usually mean: the source's
-# own unqualified row if it has one, else the highest effort.
-_EFFORT_PREF = ("", "max", "xhigh", "high", "medium", "low", "xlow", "minimal")
+def _model_effort(model):
+    """The effort level of an AA model, from whichever attr carries one.
+
+    The slug often lacks the level the display name has ("gpt-5-5" is
+    "GPT-5.5 (xhigh)"), and a non-reasoning marker on any attr overrides a
+    level found on another.
+    """
+    effs = [e for e in (_lb_effort(model.get(a))
+                        for a in ("slug", "short_name", "name")) if e]
+    if "none" in effs:
+        return "none"
+    return effs[0] if effs else ""
+
+
+def _model_norms(model):
+    """Every non-empty `_lb_norm` of an AA model's slug / short_name / name."""
+    for attr, is_slug in (("slug", True), ("short_name", False), ("name", False)):
+        if n := _lb_norm(model.get(attr), is_slug=is_slug):
+            yield n
+
+
+# Effort levels from highest to lowest. "" (unqualified) ranks highest: a run
+# that doesn't state its thinking level is assumed to be at the highest level
+# available, never a lower one. "none" (non-reasoning) ranks below everything.
+_EFFORT_PREF = ("", "max", "xhigh", "high", "medium", "low", "xlow", "minimal", "none")
+_EFFORT_RANK = {e: i for i, e in enumerate(_EFFORT_PREF)}
+
+# Highest effort rank each AA norm group reaches across its variants. Filled
+# in once the payload is parsed below; the matchers only run after that, in
+# the row loop.
+AA_TOP_EFFORT = {}
 
 
 def make_matcher(scores, aliases={}):
@@ -339,33 +370,47 @@ def make_matcher(scores, aliases={}):
     `scores` maps source-side model ids to field dicts; `aliases` maps the
     AA-side normalized form to the source-side one for names the normalizer
     can't reconcile.
+
+    An AA model matches the source row at its exact effort level, else the
+    nearest *lower* level (a max variant takes the xhigh row when there is no
+    max row, high takes medium, ...) — never a higher one, since a higher
+    level's score would overstate the variant. Unqualified sides are assumed
+    to mean the highest available level: a source row with no stated level
+    (e.g. all of CursorBench) attaches only to the AA group's highest-effort
+    variant, and an AA model with no stated level takes the source's
+    unqualified row, else its highest-effort row.
     """
-    rank = {e: i for i, e in enumerate(_EFFORT_PREF)}
-    by_norm = {}
     by_norm_effort = {}
-    # Iterate least-preferred effort first so preferred variants win in by_norm.
-    for k in sorted(scores, key=lambda k: -rank.get(_lb_effort(k), len(rank))):
-        by_norm[_lb_norm(k)] = k
+    # Iterate lowest effort first so on (norm, effort) collisions the id
+    # sorted() ranks higher wins deterministically.
+    for k in sorted(scores, key=lambda k: -_EFFORT_RANK[_lb_effort(k)]):
         by_norm_effort[(_lb_norm(k), _lb_effort(k))] = k
 
     def match(model):
         """Return the source's field dict for an AA model dict, or {}."""
-        attrs = (("slug", True), ("short_name", False), ("name", False))
-        norms = []
-        for attr, is_slug in attrs:
-            raw = model.get(attr)
-            n = _lb_norm(raw, is_slug=is_slug)
-            if n:
-                norms.append((aliases.get(n, n), _lb_effort(raw)))
-        # Prefer an exact effort match from *any* attr before falling back to
-        # the bare norm, so a no-effort slug never grabs the wrong variant's row
-        # when a later attr (e.g. name "GPT-5.5 (xhigh)") carries the effort.
-        for n, e in norms:
-            if e and (key := by_norm_effort.get((n, e))):
-                return scores[key]
-        for n, _ in norms:
-            if key := by_norm.get(n):
-                return scores[key]
+        eff = _model_effort(model)
+        norms = list(_model_norms(model))
+
+        def row(e):
+            for n in norms:
+                if key := by_norm_effort.get((aliases.get(n, n), e)):
+                    return scores[key]
+
+        if r := row(eff):
+            return r
+        # The unqualified row, only for the variant at the top of its AA
+        # group; lower variants get an explicit lower level or nothing.
+        if all(AA_TOP_EFFORT.get(n, _EFFORT_RANK[eff]) >= _EFFORT_RANK[eff]
+               for n in norms):
+            if r := row(""):
+                return r
+        # Walk down the levels below the model's own. "none" (non-reasoning)
+        # is not a lower thinking level, so it is never a fallback target.
+        for e in _EFFORT_PREF[_EFFORT_RANK[eff] + 1:]:
+            if e == "none":
+                break
+            if r := row(e):
+                return r
         return {}
 
     return match
@@ -566,6 +611,11 @@ for hit in re.finditer(r'"hostApiId":', s):
     for section in HOST_SECTIONS:
         for f, v in flatten(o.get(section) or {}).items():
             host_data[slug][f].append(v)
+
+for m in models.values():
+    eff_rank = _EFFORT_RANK[_model_effort(m)]
+    for n in _model_norms(m):
+        AA_TOP_EFFORT[n] = min(AA_TOP_EFFORT.get(n, eff_rank), eff_rank)
 
 
 rows = []
