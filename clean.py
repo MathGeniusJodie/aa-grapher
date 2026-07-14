@@ -6,6 +6,8 @@ The payload holds ~900 model×host entries. Benchmark scores live on the nested
 per model using the median.
 """
 import csv
+import glob
+import io
 import json
 import os
 import re
@@ -24,13 +26,38 @@ USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
               " (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
 
+def _fetch(url, headers=None):
+    """GET a URL as text with a browser User-Agent."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
+    with urllib.request.urlopen(req) as resp:
+        return resp.read().decode()
+
+
 def _fetch_rsc(url):
     """GET a Next.js RSC flight payload (the raw data a page hydrates from)."""
     # The RSC header makes Next.js return that raw payload instead of the HTML
     # shell, which is what the rest of this script parses.
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "RSC": "1"})
-    with urllib.request.urlopen(req) as resp:
-        return resp.read().decode()
+    return _fetch(url, {"RSC": "1"})
+
+
+def fetch_source(path, fetch_fn):
+    """Fetch an external data source, caching the text to `path`.
+
+    `--cached` reuses the cache without a network call (like `fetch_providers`);
+    a failed fetch also falls back to the cache so one flaky site doesn't lose
+    its fields from data.js. Returns None only when there is no data at all.
+    """
+    if "--cached" in sys.argv and os.path.exists(path):
+        return open(path).read()
+    try:
+        text = fetch_fn()
+    except Exception as e:
+        cached = " (using cached copy)" if os.path.exists(path) else ""
+        print(f"  ! fetch for {path} failed: {e}{cached}", file=sys.stderr)
+        return open(path).read() if os.path.exists(path) else None
+    with open(path, "w") as f:
+        f.write(text)
+    return text
 
 
 def fetch_providers(path="providers"):
@@ -165,27 +192,65 @@ def eqbench_for(model):
 
 
 # --- LiveBench results (table_<date>.csv) -------------------------------------
-# The CSV is one row per LiveBench model id with a column per benchmark task.
-# Each numeric cell is surfaced as a `livebench_<task>` field.
-def load_livebench_categories(path="categories_2026_01_08.json"):
-    """Map category name -> member column list, for aggregate scores."""
+# livebench.ai is a JS app whose bundle hard-codes the list of release dates and
+# fetches `table_<date>.csv` / `categories_<date>.json` for the newest one; do
+# the same discovery here. Releases are immutable, so a dated file already on
+# disk is reused without a network call (like `model_pages/`), and loading
+# globs for the newest local pair so `--cached` / offline runs keep working.
+LIVEBENCH_URL = "https://livebench.ai/"
+
+
+def fetch_livebench_release():
+    shell = _fetch(LIVEBENCH_URL)
+    bundle_path = re.search(r'src="\./(static/js/main\.[^"]*\.js)"', shell).group(1)
+    bundle = _fetch(LIVEBENCH_URL + bundle_path)
+    dates = json.loads(re.search(
+        r'\[\s*"20\d\d-\d\d-\d\d"(?:,"20\d\d-\d\d-\d\d")+\]', bundle).group(0))
+    return max(dates).replace("-", "_")
+
+
+def fetch_livebench_files():
+    if "--cached" in sys.argv:
+        return
     try:
-        with open(path) as f:
-            return json.load(f)
-    except FileNotFoundError:
+        release = fetch_livebench_release()
+    except Exception as e:
+        print(f"  ! couldn't discover latest LiveBench release: {e}"
+              " (using newest local files)", file=sys.stderr)
+        return
+    for name in (f"table_{release}.csv", f"categories_{release}.json"):
+        if not os.path.exists(name):
+            fetch_source(name, lambda: _fetch(LIVEBENCH_URL + name))
+
+
+fetch_livebench_files()
+
+
+def _newest(pattern):
+    """Newest local file for a `<prefix>_<yyyy_mm_dd>.<ext>` glob, or None."""
+    return max(glob.glob(pattern), default=None)
+
+
+def load_livebench_categories():
+    """Map category name -> member column list, for aggregate scores."""
+    path = _newest("categories_*.json")
+    if not path:
         return {}
+    with open(path) as f:
+        return json.load(f)
 
 
 LB_CATEGORIES = load_livebench_categories()
 
 
-def load_livebench(path="table_2026_01_08.csv"):
-    try:
-        f = open(path, newline="")
-    except FileNotFoundError:
+def load_livebench():
+    # The CSV is one row per LiveBench model id with a column per benchmark
+    # task. Each numeric cell is surfaced as a `livebench_<task>` field.
+    path = _newest("table_*.csv")
+    if not path:
         return {}
     out = {}
-    with f:
+    with open(path, newline="") as f:
         for r in csv.DictReader(f):
             mid = r.get("model")
             if not mid:
@@ -212,15 +277,22 @@ def load_livebench(path="table_2026_01_08.csv"):
 
 LIVEBENCH = load_livebench()
 
-# LiveBench ids drop reasoning/effort/serving descriptors and order size tokens
-# differently from AA, so match on a normalized form (cf. `_eq_norm`). LB_ALIASES
-# cover reorderings (AA writes "4.5 Haiku", LiveBench "haiku-4-5") and stray
-# release dates the date regexes don't catch.
+# Benchmark-site model ids drop reasoning/effort/serving descriptors and order
+# size tokens differently from AA, so match on a normalized form (cf.
+# `_eq_norm`); this matcher is shared by LiveBench, CursorBench, DeepSWE and
+# SimpleBench. Per-source ALIASES cover reorderings (AA writes "4.5 Haiku",
+# LiveBench "haiku-4-5") and stray release dates the date regexes don't catch.
 _LB_DROP = {"base", "thinking", "reasoning", "nonreasoning", "nothinking",
             "high", "low", "medium", "xhigh", "max", "effort", "highthinking",
-            "lowthinking", "preview", "exp", "auto", "32k", "64k", "16k",
+            "lowthinking", "preview", "exp", "auto", "unknown",
             "instruct", "it", "chat", "latest", "beta", "free", "hf",
             "minimal", "instant", "non", "fast"}
+
+
+def _lb_drop(token):
+    # `\d+k` context-length tokens (32k, 12k...) are serving descriptors too;
+    # parameter-count tokens like "120b" are kept so model variants don't collide.
+    return token in _LB_DROP or re.fullmatch(r"\d{1,3}k", token)
 
 
 def _lb_norm(x, is_slug=False):
@@ -234,7 +306,7 @@ def _lb_norm(x, is_slug=False):
     x = re.sub(r"\d{2}-\d{4}", "", x)            # mm-yyyy
     x = re.sub(r"(?<!\d)\d{2}-\d{2}(?!\d)", "", x)  # mm-dd
     x = re.sub(r"\d{8}", "", x)                  # yyyymmdd
-    return "".join(p for p in re.split(r"[^a-z0-9]+", x) if p and p not in _LB_DROP)
+    return "".join(p for p in re.split(r"[^a-z0-9]+", x) if p and not _lb_drop(p))
 
 
 # `_lb_norm` drops effort descriptors (xhigh/medium/...), so distinct LiveBench
@@ -255,34 +327,128 @@ def _lb_effort(x):
     return ""
 
 
+# When an AA model carries no effort level but the source scored several
+# effort variants, fall back to the variant people usually mean: the source's
+# own unqualified row if it has one, else the highest effort.
+_EFFORT_PREF = ("", "max", "xhigh", "high", "medium", "low", "xlow", "minimal")
+
+
+def make_matcher(scores, aliases={}):
+    """Build an AA-model -> `scores`-entry matcher on `_lb_norm`/`_lb_effort`.
+
+    `scores` maps source-side model ids to field dicts; `aliases` maps the
+    AA-side normalized form to the source-side one for names the normalizer
+    can't reconcile.
+    """
+    rank = {e: i for i, e in enumerate(_EFFORT_PREF)}
+    by_norm = {}
+    by_norm_effort = {}
+    # Iterate least-preferred effort first so preferred variants win in by_norm.
+    for k in sorted(scores, key=lambda k: -rank.get(_lb_effort(k), len(rank))):
+        by_norm[_lb_norm(k)] = k
+        by_norm_effort[(_lb_norm(k), _lb_effort(k))] = k
+
+    def match(model):
+        """Return the source's field dict for an AA model dict, or {}."""
+        attrs = (("slug", True), ("short_name", False), ("name", False))
+        norms = []
+        for attr, is_slug in attrs:
+            raw = model.get(attr)
+            n = _lb_norm(raw, is_slug=is_slug)
+            if n:
+                norms.append((aliases.get(n, n), _lb_effort(raw)))
+        # Prefer an exact effort match from *any* attr before falling back to
+        # the bare norm, so a no-effort slug never grabs the wrong variant's row
+        # when a later attr (e.g. name "GPT-5.5 (xhigh)") carries the effort.
+        for n, e in norms:
+            if e and (key := by_norm_effort.get((n, e))):
+                return scores[key]
+        for n, _ in norms:
+            if key := by_norm.get(n):
+                return scores[key]
+        return {}
+
+    return match
+
+
 # keyed by the AA-side normalized form, value is the LiveBench-side form
 LB_ALIASES = {
     "claude45haiku": "claudehaiku45", "claude45sonnet": "claudesonnet45",
     "grok4": "grok40709", "grokcode1": "grokcode10825",
 }
-_LB_BY_NORM = {_lb_norm(k): k for k in LIVEBENCH}
-_LB_BY_NORM_EFFORT = {(_lb_norm(k), _lb_effort(k)): k for k in LIVEBENCH}
+livebench_for = make_matcher(LIVEBENCH, LB_ALIASES)
 
 
-def livebench_for(model):
-    """Return the livebench_* dict for an AA model dict, or {} if no match."""
-    attrs = (("slug", True), ("short_name", False), ("name", False))
-    norms = []
-    for attr, is_slug in attrs:
-        raw = model.get(attr)
-        n = _lb_norm(raw, is_slug=is_slug)
-        if n:
-            norms.append((LB_ALIASES.get(n, n), _lb_effort(raw)))
-    # Prefer an exact effort match from *any* attr before falling back to the
-    # bare norm, so a no-effort slug never grabs the wrong variant's row when a
-    # later attr (e.g. name "GPT-5.5 (xhigh)") carries the effort level.
-    for n, e in norms:
-        if e and (key := _LB_BY_NORM_EFFORT.get((n, e))):
-            return LIVEBENCH[key]
-    for n, _ in norms:
-        if key := _LB_BY_NORM.get(n):
-            return LIVEBENCH[key]
-    return {}
+# --- CursorBench (benchlm.ai) --------------------------------------------------
+# BenchLM's page embeds the leaderboard in the standard Next.js `__NEXT_DATA__`
+# blob. `score` is the CursorBench result itself; `overallScore`/`displayScore`
+# are BenchLM's own composite ratings, which we don't surface.
+def load_cursorbench():
+    text = fetch_source(
+        "cursorbench.html",
+        lambda: _fetch("https://benchlm.ai/benchmarks/cursorBench"))
+    if not text:
+        return {}
+    m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+                  text, re.S)
+    leaderboard = json.loads(m.group(1))["props"]["pageProps"]["leaderboard"]
+    return {e["sourceModelId"] or e["slug"]: {"cursorbench": e["score"]}
+            for e in leaderboard
+            if isinstance(e.get("score"), (int, float))}
+
+
+cursorbench_for = make_matcher(load_cursorbench())
+
+
+# --- DeepSWE (deepswe.datacurve.ai) --------------------------------------------
+# The site hydrates from a JSON artifact with one row per model x reasoning
+# effort (all rows currently use the mini-swe-agent harness). pass@1 is the
+# attempt pass rate, pass@4 is tasks with any passing rollout; both are
+# fractions, scaled to percentages to match the other benchmark fields.
+def load_deepswe():
+    text = fetch_source(
+        "deepswe.json",
+        lambda: _fetch("https://deepswe.datacurve.ai/artifacts/v1.1/leaderboard-live.json"))
+    if not text:
+        return {}
+    out = {}
+    for r in json.loads(text)["rows"]:
+        key = r["model"] + (f"-{r['reasoning_effort']}" if r.get("reasoning_effort") else "")
+        fields = {"deepswe_pass_at_1": r["pass_at_1"] * 100,
+                  "deepswe_pass_at_4": r["pass_at_4"] * 100}
+        if isinstance(r.get("mean_cost_usd"), (int, float)):
+            fields["deepswe_cost_per_task"] = r["mean_cost_usd"]
+        out[key] = fields
+    return out
+
+
+deepswe_for = make_matcher(load_deepswe())
+
+
+# --- SimpleBench (via epoch.ai) ------------------------------------------------
+# Epoch republishes the SimpleBench leaderboard as a plain CSV under
+# /data/external_benchmarks/ (path list at /data/external_benchmark_paths.json).
+# One row per model version; the 0-1 "Score (AVG@5)" is scaled to a percentage.
+def load_simplebench():
+    text = fetch_source(
+        "simplebench.csv",
+        lambda: _fetch("https://epoch.ai/data/external_benchmarks/simplebench.csv"))
+    if not text:
+        return {}
+    out = {}
+    for r in csv.DictReader(io.StringIO(text)):
+        try:
+            score = float(r["Score (AVG@5)"])
+        except (TypeError, ValueError):
+            continue
+        # Version ids qualify unmeasured settings with "unknown"; the bare token
+        # is dropped by the normalizer, but "_prounknown" fuses it onto "pro".
+        key = r["Model version"].replace("prounknown", "pro")
+        out[key] = {"simplebench": score * 100}
+    return out
+
+
+simplebench_for = make_matcher(load_simplebench())
 
 
 def enclosing_object(text, i):
@@ -411,6 +577,9 @@ for slug, m in models.items():
     row["num_hosts"] = len(host_data[slug].get("price_1m_blended", []))
     row.update(eqbench_for(m))
     row.update(livebench_for(m))
+    row.update(cursorbench_for(m))
+    row.update(deepswe_for(m))
+    row.update(simplebench_for(m))
     row["name"] = labels.get(slug) or slug
     row["creator"] = (m.get("creator") or {}).get("name", "")
     row["open_weights"] = bool(m.get("isOpenWeights"))
@@ -486,12 +655,17 @@ def default_scale(field):
     return "linear"
 
 
+PRETTY_PREFIX = {"eqbench3_": "EQB3", "livebench_": "LiveBench", "deepswe_": "DeepSWE"}
+PRETTY_EXACT = {"cursorbench": "CursorBench", "simplebench": "SimpleBench"}
+
+
 def pretty_name(field):
     """Convert snake_case / dot.separated field names to Title Case words."""
-    if field.startswith("eqbench3_"):
-        return "EQB3 " + pretty_name(field[len("eqbench3_"):])
-    if field.startswith("livebench_"):
-        return "LiveBench " + pretty_name(field[len("livebench_"):])
+    if field in PRETTY_EXACT:
+        return PRETTY_EXACT[field]
+    for prefix, label in PRETTY_PREFIX.items():
+        if field.startswith(prefix):
+            return f"{label} " + pretty_name(field[len(prefix):])
     return " ".join(w.upper() if w in ("elo", "aime", "aq", "ttfc", "ci", "p25", "p50", "p75", "p95", "p5")
                    else w.capitalize()
                    for w in re.split(r"[_.]", field))
