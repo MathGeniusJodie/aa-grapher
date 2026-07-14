@@ -7,7 +7,6 @@ per model using the median.
 """
 import csv
 import glob
-import io
 import json
 import os
 import re
@@ -328,6 +327,13 @@ def _lb_effort(x):
     for e in _LB_EFFORTS:
         if e in toks:
             return e
+    if "med" in toks:                  # SimpleBench writes "(med)" for medium
+        return "medium"
+    # A "thinking" run with no stated level ("Kimi K2 Thinking"). The
+    # normalizer drops the token, so without this pseudo-level the model
+    # collapses onto its non-thinking sibling and inherits its score.
+    if "thinking" in toks:
+        return "thinking"
     return ""
 
 
@@ -354,8 +360,10 @@ def _model_norms(model):
 
 # Effort levels from highest to lowest. "" (unqualified) ranks highest: a run
 # that doesn't state its thinking level is assumed to be at the highest level
-# available, never a lower one. "none" (non-reasoning) ranks below everything.
-_EFFORT_PREF = ("", "max", "xhigh", "high", "medium", "low", "xlow", "minimal", "none")
+# available, never a lower one. "thinking" (reasoning on, level unstated) sits
+# just below it. "none" (non-reasoning) ranks below everything.
+_EFFORT_PREF = ("", "thinking", "max", "xhigh", "high", "medium", "low", "xlow",
+                "minimal", "none")
 _EFFORT_RANK = {e: i for i, e in enumerate(_EFFORT_PREF)}
 
 # Highest effort rank each AA norm group reaches across its variants. Filled
@@ -392,7 +400,11 @@ def make_matcher(scores, aliases={}):
         norms = list(_model_norms(model))
 
         def row(e):
-            for n in norms:
+            # Most specific (longest) norm first: a display name may carry a
+            # version tag the slug lacks ("deepseek-r1" slug vs "DeepSeek R1
+            # 0528" name), and the tagged form must beat the bare one, which
+            # belongs to a different release.
+            for n in sorted(norms, key=len, reverse=True):
                 if key := by_norm_effort.get((aliases.get(n, n), e)):
                     return scores[key]
 
@@ -400,8 +412,13 @@ def make_matcher(scores, aliases={}):
             return r
         # The unqualified row, only for the variant at the top of its AA
         # group; lower variants get an explicit lower level or nothing.
-        if all(AA_TOP_EFFORT.get(n, _EFFORT_RANK[eff]) >= _EFFORT_RANK[eff]
-               for n in norms):
+        # "thinking" counts as unqualified here: AA tags ordinary reasoning
+        # serving duplicates with bare "-thinking" slugs (e.g. Vertex hosts),
+        # and those must share their unqualified sibling's row. A genuine
+        # thinking/non-thinking split is still routed by the exact-effort
+        # lookup above before this gate is reached.
+        gate = _EFFORT_RANK["" if eff == "thinking" else eff]
+        if all(AA_TOP_EFFORT.get(n, gate) >= gate for n in norms):
             if r := row(""):
                 return r
         # Walk down the levels below the model's own. "none" (non-reasoning)
@@ -470,30 +487,55 @@ def load_deepswe():
 deepswe_for = make_matcher(load_deepswe())
 
 
-# --- SimpleBench (via epoch.ai) ------------------------------------------------
-# Epoch republishes the SimpleBench leaderboard as a plain CSV under
-# /data/external_benchmarks/ (path list at /data/external_benchmark_paths.json).
-# One row per model version; the 0-1 "Score (AVG@5)" is scaled to a percentage.
+# --- SimpleBench (simple-bench.com) --------------------------------------------
+# The site hydrates its table from a plain JS array in leaderboard-data.js.
+# That file is the source of truth: Epoch's CSV mirror (previously used here)
+# lags behind it, missing models and carrying since-revised scores. The file
+# also holds an `openEndedData` table for a different benchmark, so only the
+# `leaderboardData` array is parsed.
 def load_simplebench():
     text = fetch_source(
-        "simplebench.csv",
-        lambda: _fetch("https://epoch.ai/data/external_benchmarks/simplebench.csv"))
+        "simplebench.js",
+        lambda: _fetch("https://simple-bench.com/static/js/leaderboard-data.js"))
     if not text:
         return {}
+    table = re.search(r"const leaderboardData = \[(.*?)\];", text, re.S).group(1)
     out = {}
-    for r in csv.DictReader(io.StringIO(text)):
-        try:
-            score = float(r["Score (AVG@5)"])
-        except (TypeError, ValueError):
+    seen = set()
+    for name, score in re.findall(
+            r'model:\s*"([^"]+)"\s*,\s*score:\s*"([\d.]+)%"', table):
+        if "Human" in name:            # the two human-baseline rows
             continue
-        # Version ids qualify unmeasured settings with "unknown"; the bare token
-        # is dropped by the normalizer, but "_prounknown" fuses it onto "pro".
-        key = r["Model version"].replace("prounknown", "pro")
-        out[key] = {"simplebench": score * 100}
+        # "+" is eaten by the normalizer but AA slugs spell it "plus"
+        # (Command R+ / command-r-plus).
+        key = name.replace("+", " plus")
+        # Bare mm-dd version tags ("DeepSeek V3 03-24", "DeepSeek R1 05/28")
+        # would otherwise collide with the undated base model: the normalizer
+        # strips dashed dates and treats "/" as a path separator, keeping only
+        # what follows it. Fuse them into version tokens the way AA writes
+        # them ("V3 0324", "R1 0528"). The lookarounds leave full ISO dates
+        # ("o1-2024-12-17") intact for the normalizer to strip whole.
+        key = re.sub(r"(?<![\d-])(\d{2})[-/](\d{2})(?![\d-])", r"\1\2", key)
+        # Parenthesized tags vanish from norms, so revisions like "Gemini 2.5
+        # Pro (06-05)" vs "(03-25)" still collide; rows come in rank order, so
+        # keep the first (higher-scoring, in practice newer) one.
+        sig = (_lb_norm(key), _lb_effort(key))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out[key] = {"simplebench": float(score)}
     return out
 
 
-simplebench_for = make_matcher(load_simplebench())
+# keyed by the AA-side normalized form, value is the SimpleBench-side form
+SB_ALIASES = {
+    "claudefable5": "claudefable",     # site omits the version number
+    "mistrallarge2": "mistrallargev2",
+    # the site only benchmarked the 08-06 snapshot; AA's May/Nov refreshes
+    # carried this score under the old Epoch source too
+    "gpt4o": "gpt4o0806",
+}
+simplebench_for = make_matcher(load_simplebench(), SB_ALIASES)
 
 
 def enclosing_object(text, i):
