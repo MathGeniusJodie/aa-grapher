@@ -116,7 +116,21 @@ if "--fetch-model" in sys.argv:
 
 
 s = fetch_providers()
-decoder = json.JSONDecoder()
+
+
+def _drop_undefined(pairs):
+    """Drop keys the RSC payload encodes as the string "$undefined".
+
+    Next.js flight serialises a JS `undefined` value as "$undefined" rather than
+    omitting the key, so a missing sub-object arrives as a string where the rest
+    of this script expects a dict (upstream now does this for `performance` on
+    hosts that report no speed data). Dropping the key at decode time keeps that
+    wire detail out of the extraction code, which already handles absent keys.
+    """
+    return {k: v for k, v in pairs if v != "$undefined"}
+
+
+decoder = json.JSONDecoder(object_pairs_hook=_drop_undefined)
 
 
 # --- EQBench 3 results (eqbench3_chartdata.js) ---------------------------------
@@ -669,6 +683,7 @@ def model_page_fields(slug, text):
 HOST_SECTIONS = ("pricing", "performance", "features")
 models = {}          # slug -> model dict (with `name` injected for matching)
 labels = {}          # slug -> display label
+hosts = defaultdict(set)   # slug -> set of host slugs
 host_data = defaultdict(lambda: defaultdict(list))
 for hit in re.finditer(r'"hostApiId":', s):
     o = enclosing_object(s, hit.start())
@@ -686,6 +701,13 @@ for hit in re.finditer(r'"hostApiId":', s):
         models[slug] = model
     if label and slug not in labels:
         labels[slug] = label
+    # `hostApiId` names the model as that host spells it, not the host itself
+    # (every provider serving Kimi K2.6 reports "moonshotai/Kimi-K2.6"), so
+    # hosts are counted by `host.slug`. A host can list one model more than
+    # once — a dated snapshot beside its alias, a "-turbo" endpoint beside the
+    # standard one — and that is still one host, hence a set.
+    if host_slug := (o.get("host") or {}).get("slug"):
+        hosts[slug].add(host_slug)
     for section in HOST_SECTIONS:
         for f, v in flatten(o.get(section) or {}).items():
             host_data[slug][f].append(v)
@@ -702,7 +724,7 @@ for slug, m in models.items():
     row = flatten(m)
     for f, vals in host_data[slug].items():
         row[f] = median(vals)
-    row["num_hosts"] = len(host_data[slug].get("price_1m_blended", []))
+    row["num_hosts"] = len(hosts[slug])
     row.update(eqbench_for(m))
     row.update(eqbench4_for(m))
     row.update(livebench_for(m))
