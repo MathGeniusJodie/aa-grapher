@@ -281,11 +281,14 @@ LIVEBENCH = load_livebench()
 # `_eq_norm`); this matcher is shared by LiveBench, CursorBench, DeepSWE and
 # SimpleBench. Per-source ALIASES cover reorderings (AA writes "4.5 Haiku",
 # LiveBench "haiku-4-5") and stray release dates the date regexes don't catch.
+# Only genuine descriptors belong here: a token that names a distinct model
+# ("GPT-5.5 Instant" is its own model, not a serving mode of GPT-5.5) must be
+# kept, or that model silently inherits its namesake's scores.
 _LB_DROP = {"base", "thinking", "reasoning", "nonreasoning", "nothinking",
             "high", "low", "medium", "xhigh", "max", "effort", "highthinking",
             "lowthinking", "preview", "exp", "auto", "unknown",
             "instruct", "it", "chat", "latest", "beta", "free", "hf",
-            "minimal", "instant", "non", "fast"}
+            "minimal", "non"}
 
 
 def _lb_drop(token):
@@ -433,12 +436,45 @@ def make_matcher(scores, aliases={}):
     return match
 
 
+# AA orders the older Claude names version-first ("Claude 4.5 Haiku") where the
+# benchmark sites write them model-first ("claude-haiku-4-5"); the normalizer
+# can't reorder tokens, so alias the AA-side form for any source using it.
+CLAUDE_ORDER_ALIASES = {"claude45haiku": "claudehaiku45",
+                        "claude45sonnet": "claudesonnet45"}
+
 # keyed by the AA-side normalized form, value is the LiveBench-side form
-LB_ALIASES = {
-    "claude45haiku": "claudehaiku45", "claude45sonnet": "claudesonnet45",
-    "grok4": "grok40709", "grokcode1": "grokcode10825",
-}
+LB_ALIASES = {**CLAUDE_ORDER_ALIASES,
+              "grok4": "grok40709", "grokcode1": "grokcode10825"}
 livebench_for = make_matcher(LIVEBENCH, LB_ALIASES)
+
+
+# --- EQ-Bench 4 (eqbench.com) --------------------------------------------------
+# The leaderboard hydrates from `const EQBENCH4_DATA = {...};`. It is a separate
+# run from EQ-Bench 3 above with its own dimensions, so both are surfaced. Per
+# model we take the headline Elo, the eight descriptive `dims` traits and the
+# six ability scores. Abilities come from the "absolute" mode (per-dimension,
+# min-max normalized 1-10 across the board) rather than the site's default
+# "neighbour" mode, whose signed margins are only meaningful against a model's
+# own Elo neighbours and so can't be compared across the leaderboard.
+def load_eqbench4():
+    text = fetch_source(
+        "eqbench4_data.js",
+        lambda: _fetch("https://eqbench.com/eqbench4/eqbench4_data.js"))
+    if not text:
+        return {}
+    obj = text[text.index("{"): text.rstrip().rstrip(";").rindex("}") + 1]
+    out = {}
+    for m in json.loads(obj).get("models", []):
+        abilities = ((m.get("ability_modes") or {}).get("absolute") or {}).get("values") or {}
+        vals = {"elo": m.get("elo"), **(m.get("dims") or {}), **abilities}
+        scores = {f"eqbench4_{k}": v for k, v in vals.items()
+                  if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        if scores and m.get("model"):
+            out[m["model"]] = scores
+    return out
+
+
+eqbench4_for = make_matcher(load_eqbench4(), CLAUDE_ORDER_ALIASES)
 
 
 # --- CursorBench (benchlm.ai) --------------------------------------------------
@@ -668,6 +704,7 @@ for slug, m in models.items():
         row[f] = median(vals)
     row["num_hosts"] = len(host_data[slug].get("price_1m_blended", []))
     row.update(eqbench_for(m))
+    row.update(eqbench4_for(m))
     row.update(livebench_for(m))
     row.update(cursorbench_for(m))
     row.update(deepswe_for(m))
@@ -747,7 +784,8 @@ def default_scale(field):
     return "linear"
 
 
-PRETTY_PREFIX = {"eqbench3_": "EQB3", "livebench_": "LiveBench", "deepswe_": "DeepSWE"}
+PRETTY_PREFIX = {"eqbench3_": "EQB3", "eqbench4_": "EQB4",
+                 "livebench_": "LiveBench", "deepswe_": "DeepSWE"}
 PRETTY_EXACT = {"cursorbench": "CursorBench", "simplebench": "SimpleBench"}
 
 
