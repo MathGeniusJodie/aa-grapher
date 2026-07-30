@@ -2,8 +2,9 @@
 """Extract model data from the Next.js RSC payload in `providers` and write data.js.
 
 The payload holds ~900 model×host entries. Benchmark scores live on the nested
-"model" object; pricing and speed live on the host entry. We aggregate hosts
-per model using the median.
+"model" object; pricing and speed live on the host entry. Speed is aggregated
+across a model's hosts using the median; pricing is taken from its cheapest
+host (see `price_rank`).
 """
 import csv
 import glob
@@ -678,12 +679,14 @@ def model_page_fields(slug, text):
     return flatten(trimmed)
 
 
-# Benchmark scores live on `model` and are identical across a model's hosts;
-# per-host `pricing`/`performance`/`features` are aggregated by median.
-HOST_SECTIONS = ("pricing", "performance", "features")
+# Benchmark scores live on `model` and are identical across a model's hosts.
+# Per-host `performance`/`features` are aggregated by median; `pricing` is kept
+# whole per host and resolved to the cheapest one below.
+HOST_SECTIONS = ("performance", "features")
 models = {}          # slug -> model dict (with `name` injected for matching)
 labels = {}          # slug -> display label
 hosts = defaultdict(set)   # slug -> set of host slugs
+host_pricing = defaultdict(list)   # slug -> one flattened `pricing` per host
 host_data = defaultdict(lambda: defaultdict(list))
 for hit in re.finditer(r'"hostApiId":', s):
     o = enclosing_object(s, hit.start())
@@ -708,6 +711,8 @@ for hit in re.finditer(r'"hostApiId":', s):
     # standard one — and that is still one host, hence a set.
     if host_slug := (o.get("host") or {}).get("slug"):
         hosts[slug].add(host_slug)
+    if pricing := flatten(o.get("pricing") or {}):
+        host_pricing[slug].append(pricing)
     for section in HOST_SECTIONS:
         for f, v in flatten(o.get(section) or {}).items():
             host_data[slug][f].append(v)
@@ -718,12 +723,32 @@ for m in models.values():
         AA_TOP_EFFORT[n] = min(AA_TOP_EFFORT.get(n, eff_rank), eff_rank)
 
 
+def price_rank(pricing):
+    """Sort key selecting a model's cheapest host, on a 3:1 input/output blend.
+
+    Every host entry carries both token prices, unlike `costPerTask` (44% of
+    entries) and the cache prices, so this is the only key that ranks the whole
+    set. The blend is what makes it a ranking rather than a guess: cheapest-by-
+    input alone picks a different host for 17 of the 218 multi-host models.
+    """
+    return (3 * pricing["price_1m_input_tokens"]
+            + pricing["price_1m_output_tokens"]) / 4
+
+
 rows = []
 row_slugs = []
 for slug, m in models.items():
     row = flatten(m)
     for f, vals in host_data[slug].items():
         row[f] = median(vals)
+    # Pricing is one host's whole quote, not a per-field median across hosts.
+    # A median mixes hosts — cheap input from one, dear output from another —
+    # into a quote nobody actually offers, and a single reseller that hasn't
+    # passed on a price cut drags the model up: Amazon Bedrock still lists
+    # GPT-5.6 Luna at the pre-cut $1.10/$6.60 against OpenAI's $0.20/$1.20,
+    # which medianed to a fictional $0.65/$3.90.
+    if quotes := host_pricing[slug]:
+        row.update(min(quotes, key=price_rank))
     row["num_hosts"] = len(hosts[slug])
     row.update(eqbench_for(m))
     row.update(eqbench4_for(m))
