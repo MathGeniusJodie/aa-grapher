@@ -8,6 +8,7 @@ host (see `price_rank`).
 """
 import csv
 import glob
+import io
 import json
 import os
 import re
@@ -16,6 +17,9 @@ import time
 import urllib.request
 from collections import Counter, defaultdict
 from statistics import median
+
+from scipy.optimize import minimize_scalar
+from scipy.special import expit
 
 PROVIDERS_URL = "https://artificialanalysis.ai/leaderboards/providers"
 MODEL_PAGE_URL = "https://artificialanalysis.ai/models/{slug}"
@@ -453,8 +457,12 @@ def make_matcher(scores, aliases={}):
 
 # AA orders the older Claude names version-first ("Claude 4.5 Haiku") where the
 # benchmark sites write them model-first ("claude-haiku-4-5"); the normalizer
-# can't reorder tokens, so alias the AA-side form for any source using it.
-CLAUDE_ORDER_ALIASES = {"claude45haiku": "claudehaiku45",
+# can't reorder tokens, so alias the AA-side form for any source using it. AA
+# switched to model-first at Opus 4.5, so nothing newer needs an entry.
+CLAUDE_ORDER_ALIASES = {"claude4opus": "claudeopus4",
+                        "claude41opus": "claudeopus41",
+                        "claude4sonnet": "claudesonnet4",
+                        "claude45haiku": "claudehaiku45",
                         "claude45sonnet": "claudesonnet45"}
 
 # keyed by the AA-side normalized form, value is the LiveBench-side form
@@ -587,6 +595,135 @@ SB_ALIASES = {
     "gpt4o": "gpt4o0806",
 }
 simplebench_for = make_matcher(load_simplebench(), SB_ALIASES)
+
+
+# --- Epoch AI (epoch.ai) -------------------------------------------------------
+# Epoch's explorers hydrate from a handful of published data files, all of which
+# key models by a plain, effort-free name ("GPT-5.4", not "GPT-5.4 (xhigh)").
+# Keying the source rows that way is what puts these scores on the highest
+# thinking level only: `make_matcher` attaches an unqualified row to the top
+# variant of an AA group and to nothing below it.
+def load_epoch(name):
+    """Fetch one of Epoch's published data files, cached as `epoch_<name>`."""
+    return fetch_source(f"epoch_{name}",
+                        lambda: _fetch(f"https://epoch.ai/data/{name}"))
+
+
+def _epoch_rows(text):
+    # Epoch's CSVs carry model abstracts with embedded newlines, so they have to
+    # be read through a file object rather than line by line.
+    return csv.DictReader(io.StringIO(text, newline=""))
+
+
+def _bench_key(name):
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+# --- Epoch SWE-ECI (epoch.ai/eci, "Software engineering" subset) ---------------
+# The ECI places models on a single capability scale by fitting a logistic item-
+# response model: benchmark b has a difficulty (`edi`) and a slope, model m has a
+# capability, and the predicted score is sigmoid(slope_b * (cap_m - edi_b)).
+# Epoch publishes the fitted benchmark parameters but not the domain subsets:
+# the site refits each model's capability in the browser against just the chosen
+# domain's benchmarks, so that refit is reproduced here (least squares on the
+# published `edi`/slope, same clamps, bounds and 2-benchmark floor as the site).
+# Verified against the rendered leaderboard: every model it lists agrees with
+# this refit to the 0.1 decimal place it displays.
+SWE_ECI_DOMAIN = "Software engineering"
+SWE_ECI_MIN_BENCHMARKS = 2      # the explorer's default "Min. benchmarks"
+_ECI_BOUNDS = (-100.0, 300.0)   # the scale's plausible-capability range
+
+
+def _refit_eci(points):
+    """The capability whose predicted scores best fit `(perf, edi, slope)`."""
+    def loss(capability):
+        return sum((perf - expit(slope * (capability - edi))) ** 2
+                   for perf, edi, slope in points)
+
+    return float(minimize_scalar(loss, bounds=_ECI_BOUNDS, method="bounded",
+                                 options={"xatol": 1e-8}).x)
+
+
+def load_swe_eci():
+    meta, edi_text, perf_text, eci_text = (
+        load_epoch(n) for n in ("benchmarks.json", "edi_scores.csv",
+                                "eci_benchmarks.csv", "eci_scores.csv"))
+    if not all((meta, edi_text, perf_text, eci_text)):
+        return {}
+    # Which benchmarks count as software engineering is metadata on the
+    # benchmark registry, which keys entries by id where the fit keys them by
+    # title (and vice versa), so both spellings are indexed.
+    domains = {_bench_key(k): b.get("domains") or []
+               for b in json.loads(meta).values()
+               for k in (b.get("id"), b.get("title")) if k}
+    edi = {r["benchmark_name"]: (float(r["edi"]), float(r["estimated_slope_scaled"]))
+           for r in _epoch_rows(edi_text)}
+    subset = [b for b in edi if SWE_ECI_DOMAIN in domains.get(_bench_key(b), ())]
+
+    # A model runs a benchmark at several thinking levels; the ECI scores it on
+    # its best run, so the subset refit sees one score per benchmark.
+    perf = defaultdict(dict)
+    for r in _epoch_rows(perf_text):
+        try:
+            score = float(r["performance"])
+        except ValueError:
+            continue
+        best = perf[r["model_group"]]
+        best[r["benchmark"]] = max(score, best.get(r["benchmark"], score))
+
+    out = {}
+    seen = set()
+    for r in _epoch_rows(eci_text):
+        # Epoch dates its reruns where AA tags them with a version or nothing at
+        # all ("DeepSeek-V3.2-Exp" / "DeepSeek V3.2", "o1-preview" / "o1"), and
+        # the normalizer drops both the dates and the tags, so those rows all
+        # collapse onto one key. Rows come in descending ECI order, so keeping
+        # the first hands AA's model its best-scoring release rather than an
+        # arbitrary one.
+        sig = (_lb_norm(r["Model"]), _lb_effort(r["Model"]))
+        if sig in seen:
+            continue
+        scores = perf.get(r["Model"], {})
+        # Scores are clamped off 0 and 1, where the logistic's inverse diverges.
+        points = [(min(max(scores[b], 0.001), 0.999), *edi[b])
+                  for b in subset if b in scores]
+        if len(points) >= SWE_ECI_MIN_BENCHMARKS:
+            seen.add(sig)
+            out[r["Model"]] = {"swe_eci": _refit_eci(points)}
+    return out
+
+
+swe_eci_for = make_matcher(load_swe_eci(), CLAUDE_ORDER_ALIASES)
+
+
+# --- FrontierMath Tier 4 v2 (epoch.ai/frontiermath) ----------------------------
+# Epoch's whole benchmarking hub ships as one CSV of eval runs, one row per
+# model version (model x thinking level) per task. Tier 4 is the 48-problem
+# expansion set of research-level problems; the hub reports the private split.
+FRONTIERMATH_TASK = "FrontierMath-Tier-4-v2-Private"
+
+
+def load_frontiermath():
+    text = load_epoch("benchmarks.csv")
+    if not text:
+        return {}
+    best = {}
+    for r in _epoch_rows(text):
+        if r["task"] != FRONTIERMATH_TASK or r["Status"] != "Success":
+            continue
+        # Rank by thinking level first so a model keyed by its plain name keeps
+        # the highest level Epoch ran. Score breaks ties between runs at the
+        # same level that aren't thinking levels at all: GPT-5.6 Sol is listed
+        # twice at max, once through its Pro serving mode.
+        score = float(r["mean_score"]) * 100
+        rank = (_EFFORT_RANK[_lb_effort(r["Unique display name"] or r["Display name"])],
+                -score)
+        if r["Model"] not in best or rank < best[r["Model"]][0]:
+            best[r["Model"]] = (rank, score)
+    return {model: {"frontiermath_tier4_v2": score} for model, (_, score) in best.items()}
+
+
+frontiermath_for = make_matcher(load_frontiermath(), CLAUDE_ORDER_ALIASES)
 
 
 def enclosing_object(text, i):
@@ -756,6 +893,8 @@ for slug, m in models.items():
     row.update(cursorbench_for(m))
     row.update(deepswe_for(m))
     row.update(simplebench_for(m))
+    row.update(swe_eci_for(m))
+    row.update(frontiermath_for(m))
     row["name"] = labels.get(slug) or slug
     row["creator"] = (m.get("creator") or {}).get("name", "")
     row["open_weights"] = bool(m.get("isOpenWeights"))
@@ -833,7 +972,9 @@ def default_scale(field):
 
 PRETTY_PREFIX = {"eqbench3_": "EQB3", "eqbench4_": "EQB4",
                  "livebench_": "LiveBench", "deepswe_": "DeepSWE"}
-PRETTY_EXACT = {"cursorbench": "CursorBench", "simplebench": "SimpleBench"}
+PRETTY_EXACT = {"cursorbench": "CursorBench", "simplebench": "SimpleBench",
+                "swe_eci": "SWE-ECI (Epoch)",
+                "frontiermath_tier4_v2": "FrontierMath Tier 4 (v2)"}
 
 
 def pretty_name(field):

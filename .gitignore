@@ -15,3 +15,9 @@
 /deepswe.json
 /simplebench.csv
 /table_2026_06_25.csv
+/deploy.sh
+/epoch_benchmarks.csv
+/epoch_benchmarks.json
+/epoch_eci_benchmarks.csv
+/epoch_eci_scores.csv
+/epoch_edi_scores.csv
