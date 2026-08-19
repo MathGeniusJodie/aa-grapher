@@ -799,8 +799,8 @@ def flatten(obj, prefix=""):
 MODEL_PAGE_DUPLICATE_KEYS = {"timescaleData", "endToEndResponseTime", "timeToFirstAnswerToken"}
 
 
-def model_page_fields(slug, text):
-    """Flatten the richest `"slug":"<slug>"` object found on a model's own page.
+def find_model_object(slug, text):
+    """Richest `"slug":"<slug>"` object found on a model's own page.
 
     The same slug shows up in several shallow stub objects too (e.g. related-
     model links), so keep whichever match has the most keys.
@@ -810,10 +810,34 @@ def model_page_fields(slug, text):
         o = enclosing_object(text, m.start())
         if isinstance(o, dict) and (best is None or len(o) > len(best)):
             best = o
+    return best
+
+
+def model_page_fields(slug, text):
+    """Flatten `find_model_object`'s result, numeric leaves only."""
+    best = find_model_object(slug, text)
     if not best:
         return {}
     trimmed = {k: v for k, v in best.items() if k not in MODEL_PAGE_DUPLICATE_KEYS}
     return flatten(trimmed)
+
+
+def load_model_list(text):
+    """The page's full `"models":[...]` roster: slug -> {name, creator, ...}.
+
+    This is broader than the `hostApiId` hits below — it also carries models
+    no host currently reports pricing/performance for (e.g. brand-new
+    releases AA hasn't wired into a provider comparison yet). Those still get
+    a row, sourced entirely from their own model page during enrichment.
+    """
+    i = text.find('"models":[')
+    if i == -1:
+        return {}
+    try:
+        arr = decoder.raw_decode(text, i + len('"models":'))[0]
+    except ValueError:
+        return {}
+    return {m["slug"]: m for m in arr if isinstance(m, dict) and m.get("slug")}
 
 
 # Benchmark scores live on `model` and are identical across a model's hosts.
@@ -853,6 +877,17 @@ for hit in re.finditer(r'"hostApiId":', s):
     for section in HOST_SECTIONS:
         for f, v in flatten(o.get(section) or {}).items():
             host_data[slug][f].append(v)
+
+# Models AA lists but no host currently reports pricing/performance for (e.g.
+# a release too new to have a provider comparison wired up yet). These get no
+# host-derived fields at all — enrichment below must fetch their own page.
+hostless_slugs = set()
+for slug, m in load_model_list(s).items():
+    if slug in models or m.get("deprecated"):
+        continue
+    models[slug] = {**m, "name": m.get("name"), "short_name": m.get("name")}
+    labels.setdefault(slug, m.get("name"))
+    hostless_slugs.add(slug)
 
 for m in models.values():
     eff_rank = _EFFORT_RANK[_model_effort(m)]
@@ -927,7 +962,10 @@ ranked = sorted(scored, key=lambda t: -t[1]["intelligence_index"])
 top_n = {slug for slug, _ in (ranked if TOP_N is None else ranked[:TOP_N])}
 priced = [(slug, row) for slug, row in scored if "price_1m_blended" in row]
 pareto = set(pareto_frontier(priced, "price_1m_blended", "intelligence_index"))
-priority_slugs = top_n | pareto
+# Hostless models have no bulk-listing fields at all (no benchmarks, no
+# `isOpenWeights`), so their page fetch isn't optional the way it is for
+# everyone else — force it regardless of intelligence ranking.
+priority_slugs = top_n | pareto | hostless_slugs
 
 enriched = 0
 stopped_early = False
@@ -944,6 +982,10 @@ for slug, row in zip(row_slugs, rows):
         break
     for k, v in model_page_fields(slug, text).items():
         row.setdefault(k, v)
+    if slug in hostless_slugs:
+        obj = find_model_object(slug, text) or {}
+        if "isOpenWeights" in obj:
+            row["open_weights"] = bool(obj["isOpenWeights"])
     enriched += 1
 status = "stopped early" if stopped_early else "done"
 print(f"enriched {enriched} models from individual model pages ({status}; "
