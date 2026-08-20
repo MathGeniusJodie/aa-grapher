@@ -24,7 +24,7 @@ from scipy.special import expit
 PROVIDERS_URL = "https://artificialanalysis.ai/leaderboards/providers"
 MODEL_PAGE_URL = "https://artificialanalysis.ai/models/{slug}"
 MODEL_PAGE_CACHE_DIR = "model_pages"
-MODEL_PAGE_FETCH_DELAY = 20.0  # seconds to wait after each live model-page fetch
+MODEL_PAGE_FETCH_DELAY = 5.0  # seconds to wait after each live model-page fetch
 
 USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
               " (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
