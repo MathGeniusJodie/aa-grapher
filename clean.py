@@ -619,14 +619,16 @@ def _bench_key(name):
     return re.sub(r"[^a-z0-9]", "", name.lower())
 
 
-# --- Epoch SWE-ECI (epoch.ai/eci, "Software engineering" subset) ---------------
+# --- Epoch ECI (epoch.ai/eci) --------------------------------------------------
 # The ECI places models on a single capability scale by fitting a logistic item-
 # response model: benchmark b has a difficulty (`edi`) and a slope, model m has a
 # capability, and the predicted score is sigmoid(slope_b * (cap_m - edi_b)).
-# Epoch publishes the fitted benchmark parameters but not the domain subsets:
-# the site refits each model's capability in the browser against just the chosen
-# domain's benchmarks, so that refit is reproduced here (least squares on the
-# published `edi`/slope, same clamps, bounds and 2-benchmark floor as the site).
+# The general/combined score is fit against every benchmark and published
+# directly as the `eci` column. Domain subsets (e.g. "Software engineering")
+# aren't published though: the site refits each model's capability in the
+# browser against just the chosen domain's benchmarks, so that refit is
+# reproduced here (least squares on the published `edi`/slope, same clamps,
+# bounds and 2-benchmark floor as the site).
 # Verified against the rendered leaderboard: every model it lists agrees with
 # this refit to the 0.1 decimal place it displays.
 SWE_ECI_DOMAIN = "Software engineering"
@@ -644,7 +646,7 @@ def _refit_eci(points):
                                  options={"xatol": 1e-8}).x)
 
 
-def load_swe_eci():
+def load_eci():
     meta, edi_text, perf_text, eci_text = (
         load_epoch(n) for n in ("benchmarks.json", "edi_scores.csv",
                                 "eci_benchmarks.csv", "eci_scores.csv"))
@@ -668,7 +670,7 @@ def load_swe_eci():
             score = float(r["performance"])
         except ValueError:
             continue
-        best = perf[r["model_group"]]
+        best = perf[r["Model"]]
         best[r["benchmark"]] = max(score, best.get(r["benchmark"], score))
 
     out = {}
@@ -683,17 +685,24 @@ def load_swe_eci():
         sig = (_lb_norm(r["Model"]), _lb_effort(r["Model"]))
         if sig in seen:
             continue
+        seen.add(sig)
+        row = {}
+        try:
+            row["eci"] = float(r["eci"])
+        except (KeyError, ValueError):
+            pass
         scores = perf.get(r["Model"], {})
         # Scores are clamped off 0 and 1, where the logistic's inverse diverges.
         points = [(min(max(scores[b], 0.001), 0.999), *edi[b])
                   for b in subset if b in scores]
         if len(points) >= SWE_ECI_MIN_BENCHMARKS:
-            seen.add(sig)
-            out[r["Model"]] = {"swe_eci": _refit_eci(points)}
+            row["swe_eci"] = _refit_eci(points)
+        if row:
+            out[r["Model"]] = row
     return out
 
 
-swe_eci_for = make_matcher(load_swe_eci(), CLAUDE_ORDER_ALIASES)
+eci_for = make_matcher(load_eci(), CLAUDE_ORDER_ALIASES)
 
 
 # --- FrontierMath Tier 4 v2 (epoch.ai/frontiermath) ----------------------------
@@ -928,7 +937,7 @@ for slug, m in models.items():
     row.update(cursorbench_for(m))
     row.update(deepswe_for(m))
     row.update(simplebench_for(m))
-    row.update(swe_eci_for(m))
+    row.update(eci_for(m))
     row.update(frontiermath_for(m))
     row["name"] = labels.get(slug) or slug
     row["creator"] = (m.get("creator") or {}).get("name", "")
@@ -1015,6 +1024,7 @@ def default_scale(field):
 PRETTY_PREFIX = {"eqbench3_": "EQB3", "eqbench4_": "EQB4",
                  "livebench_": "LiveBench", "deepswe_": "DeepSWE"}
 PRETTY_EXACT = {"cursorbench": "CursorBench", "simplebench": "SimpleBench",
+                "eci": "ECI (Epoch)",
                 "swe_eci": "SWE-ECI (Epoch)",
                 "frontiermath_tier4_v2": "FrontierMath Tier 4 (v2)"}
 
