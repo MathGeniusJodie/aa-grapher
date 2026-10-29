@@ -80,8 +80,18 @@ def fetch_providers(path="providers"):
     return text
 
 
-def fetch_model_page(slug):
-    """Return a model's own page payload, fetching once and caching forever after.
+def index_version(text):
+    """The Intelligence Index version ("5.0") a payload was rendered with, or None.
+
+    Every page names the index's evaluation entry with its version; pages
+    cached before AA started doing that (pre-v4.3.2) have none.
+    """
+    m = re.search(r'"name":"Artificial Analysis Intelligence Index v(\d+(?:\.\d+)*)"', text)
+    return m.group(1) if m else None
+
+
+def fetch_model_page(slug, current_index_version=None):
+    """Return a model's own page payload, fetching once and caching after.
 
     Individual model pages carry fields the bulk `providers` listing above has
     dropped (Coding/Agentic Index, parameter count, legacy price ratios,
@@ -90,16 +100,27 @@ def fetch_model_page(slug):
     for a handful of slugs at a time; anything already cached on disk is
     reused without a network call, so add more later by dropping a page at
     `model_pages/<slug>` yourself.
+
+    A new Intelligence Index version re-scores every model and changes the
+    per-index cost/token fields, so a cached page rendered under a different
+    version than `current_index_version` is refetched. None skips that check.
     """
     os.makedirs(MODEL_PAGE_CACHE_DIR, exist_ok=True)
     path = os.path.join(MODEL_PAGE_CACHE_DIR, slug)
     if os.path.exists(path):
-        return open(path).read()
+        text = open(path).read()
+        if current_index_version is None or index_version(text) == current_index_version:
+            return text
     try:
         text = _fetch_rsc(MODEL_PAGE_URL.format(slug=slug))
     except Exception as e:
         print(f"  ! couldn't fetch model page for {slug}: {e}", file=sys.stderr)
         return None
+    if current_index_version is not None and index_version(text) != current_index_version:
+        # Otherwise this page would look stale and be refetched on every run.
+        print(f"  ! fresh page for {slug} reports Intelligence Index"
+              f" v{index_version(text)}, listing says v{current_index_version};"
+              " update `index_version`", file=sys.stderr)
     with open(path, "w") as f:
         f.write(text)
     time.sleep(MODEL_PAGE_FETCH_DELAY)
@@ -121,6 +142,10 @@ if "--fetch-model" in sys.argv:
 
 
 s = fetch_providers()
+INDEX_VERSION = index_version(s)
+if INDEX_VERSION is None:
+    print("  ! couldn't find the Intelligence Index version in `providers`;"
+          " cached model pages won't be checked for staleness", file=sys.stderr)
 
 
 def _drop_undefined(pairs):
@@ -849,6 +874,71 @@ def load_model_list(text):
     return {m["slug"]: m for m in arr if isinstance(m, dict) and m.get("slug")}
 
 
+# Since Intelligence Index v5 the bulk listing nests benchmark scores under
+# `model.scores`, keyed by AA's evaluation slugs, instead of flat camelCase keys
+# on `model`. Map each slug back to the key the listing used before, or, for
+# benchmarks new to the listing, the key the model page uses (matched value for
+# value against a live page). That keeps existing field names (and so shared
+# URLs) stable, and lands the bulk and model-page copies of a score on the same
+# field instead of two. Note `gdpval-aa-normalized` is the Elo the page calls
+# `gdpval`, not the 0-1 fraction the old `gdpvalNormalized` key held.
+SCORE_KEYS = {
+    "aa-3d": "aa3dElo",
+    "aa-analyst-agent": "analystAgent",
+    "aa-briefcase": "briefcase.elo",
+    "aime-2025": "aime25",
+    "apex-agents-aa": "apexAgents",
+    "artificial-analysis-long-context-reasoning": "lcr",
+    "automationbench-aa": "automationBench",
+    "code2video-aa": "code2videoElo",
+    "critpt": "critpt",
+    "critpt-v2-hard": "critptAgenticHard",
+    "enterprise-ops-gym-aa": "enterpriseOpsGym",
+    "frontiercode": "frontierCode",
+    "frontiercode-2-0": "frontierCode20",
+    "gdp-pdf": "gdpPdfAllPass",
+    "gdpval-aa-normalized": "gdpval",
+    "gpqa-diamond": "gpqa",
+    "harvey-lab-aa": "harveyLab",
+    "healthbench": "healthbench",
+    "healthbench-professional": "healthbenchProfessional",
+    "hle-diamond": "hleDiamond",
+    "humanitys-last-exam": "hle",
+    "ifbench": "ifbench",
+    "itbench-aa": "itbenchSre",
+    "livecodebench": "livecodebench",
+    "mlcr-aa": "mlcrOverall",
+    "mmmu-pro": "mmmuPro",
+    "omniscience-accuracy": "omniscienceAccuracy",
+    "omniscience-non-hallucination": "omniscienceNonHallucination",
+    "scicode": "scicode",
+    "tau2-bench": "tau2",
+    "tau3-banking": "tauBanking",
+    "terminal-bench-science": "terminalBenchScience",
+    "terminalbench-2-1": "terminalBench21",
+    "terminalbench-4-0": "terminalBench40",
+    "terminalbench-hard": "terminalbenchHard",
+}
+unmapped_scores = set()
+
+
+def hoist_scores(model):
+    """`model` with its `scores` object flattened back onto it under SCORE_KEYS.
+
+    Slugs missing from SCORE_KEYS still come through (snake-cased) so a new
+    benchmark isn't lost, and are reported once at the end of the parse.
+    """
+    scores = model.get("scores") or {}
+    hoisted = {}
+    for k, v in scores.items():
+        if k not in SCORE_KEYS:
+            unmapped_scores.add(k)
+        hoisted[SCORE_KEYS.get(k, k.replace("-", "_"))] = v
+    # `flatten` turns dotted keys ("briefcase.elo") into the same field name a
+    # nested object would have produced.
+    return {**{k: v for k, v in model.items() if k != "scores"}, **hoisted}
+
+
 # Benchmark scores live on `model` and are identical across a model's hosts.
 # Per-host `performance`/`features` are aggregated by median; `pricing` is kept
 # whole per host and resolved to the cheapest one below.
@@ -869,7 +959,7 @@ for hit in re.finditer(r'"hostApiId":', s):
     label = o.get("label")
     # eqbench/livebench matchers look at slug/name/short_name; the payload only
     # carries slug, so surface the display label under both name attributes.
-    model = {**model, "name": label, "short_name": label}
+    model = {**hoist_scores(model), "name": label, "short_name": label}
     if slug not in models or len(model) > len(models[slug]):
         models[slug] = model
     if label and slug not in labels:
@@ -886,6 +976,9 @@ for hit in re.finditer(r'"hostApiId":', s):
     for section in HOST_SECTIONS:
         for f, v in flatten(o.get(section) or {}).items():
             host_data[slug][f].append(v)
+if unmapped_scores:
+    print(f"  ! no SCORE_KEYS entry for {sorted(unmapped_scores)}; using the"
+          " slug as the field name", file=sys.stderr)
 
 # Models AA lists but no host currently reports pricing/performance for (e.g.
 # a release too new to have a provider comparison wired up yet). These get no
@@ -953,6 +1046,18 @@ for slug, m in models.items():
 # `fetch_model_page`). Fields already set from the bulk listing win on overlap
 # since they're aggregated across all of a model's hosts.
 TOP_N = None  # None = no cap, enrich every scored model
+# `--scored-only` fetches pages just for models with a current Intelligence
+# Index score (a quick refresh after an index version bump, instead of the
+# whole cache). Other models keep only pages already cached at the current
+# version: a stale page would hand them its old-version index score.
+SCORED_ONLY = "--scored-only" in sys.argv
+
+
+def page_is_current(slug):
+    """Whether a page is cached for `slug` at the listing's index version."""
+    path = os.path.join(MODEL_PAGE_CACHE_DIR, slug)
+    return os.path.exists(path) and (
+        INDEX_VERSION is None or index_version(open(path).read()) == INDEX_VERSION)
 
 
 def pareto_frontier(items, cost_key, quality_key):
@@ -974,15 +1079,19 @@ pareto = set(pareto_frontier(priced, "price_1m_blended", "intelligence_index"))
 # Hostless models have no bulk-listing fields at all (no benchmarks, no
 # `isOpenWeights`), so their page fetch isn't optional the way it is for
 # everyone else — force it regardless of intelligence ranking.
-priority_slugs = top_n | pareto | hostless_slugs
+priority_slugs = top_n | pareto | (set() if SCORED_ONLY else hostless_slugs)
 
 enriched = 0
+skipped_stale = 0
 stopped_early = False
 for slug, row in zip(row_slugs, rows):
-    cached = os.path.exists(os.path.join(MODEL_PAGE_CACHE_DIR, slug))
-    if slug not in priority_slugs and not cached:
-        continue
-    text = fetch_model_page(slug)
+    if slug not in priority_slugs:
+        if SCORED_ONLY and not page_is_current(slug):
+            skipped_stale += os.path.exists(os.path.join(MODEL_PAGE_CACHE_DIR, slug))
+            continue
+        if not os.path.exists(os.path.join(MODEL_PAGE_CACHE_DIR, slug)):
+            continue
+    text = fetch_model_page(slug, INDEX_VERSION)
     if text is None:
         # A live fetch failed; stop rather than retry or push on to the next
         # model (`fetch_model_page` already printed the underlying error).
@@ -999,6 +1108,9 @@ for slug, row in zip(row_slugs, rows):
 status = "stopped early" if stopped_early else "done"
 print(f"enriched {enriched} models from individual model pages ({status}; "
       f"{len(top_n)} top by intelligence, {len(pareto)} price/intelligence pareto)")
+if skipped_stale:
+    print(f"skipped {skipped_stale} models whose cached page predates Intelligence"
+          f" Index v{INDEX_VERSION} (--scored-only)")
 
 counts = Counter(k for r in rows for k in r if k not in ("name", "creator", "open_weights"))
 fields = sorted(counts)
