@@ -124,7 +124,7 @@ const NAME_TO_ID = Object.fromEntries(FIELDS.map(f => [f.name, f.id]));
 const PRETTY_TO_ID = Object.fromEntries(FIELDS.map(f => [f.pretty_name, f.id]));
 
 const ALIASES = {
-  Speed: NAME_TO_ID['median_output_speed'],
+  Speed: NAME_TO_ID['output_speed'],
   Intelligence: NAME_TO_ID['intelligence_index'],
   Price: NAME_TO_ID['intelligence_index_cost_answer'],
 };
@@ -489,7 +489,7 @@ const LB_METRICS = FIELDS.filter(f => !LB_SKIP.has(f.name))
 const Q_ID = NAME_TO_ID['intelligence_index'];
 const LB_PARETO = [
   { label: 'Price / Quality', cost: NAME_TO_ID['intelligence_index_cost_answer'] },
-  { label: 'Speed / Quality', cost: NAME_TO_ID['median_end_to_end_response_time'] },
+  { label: 'Speed / Quality', cost: NAME_TO_ID['end_to_end_time'] },
 ];
 
 function renderLeaderboard(rows) {

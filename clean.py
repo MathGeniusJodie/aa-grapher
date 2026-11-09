@@ -918,6 +918,7 @@ SCORE_KEYS = {
     "terminalbench-2-1": "terminalBench21",
     "terminalbench-4-0": "terminalBench40",
     "terminalbench-hard": "terminalbenchHard",
+    "vials-aa": "vialsScore",
 }
 unmapped_scores = set()
 
@@ -1009,6 +1010,19 @@ def price_rank(pricing):
             + pricing["price_1m_output_tokens"]) / 4
 
 
+def blended_price(pricing):
+    """AA's headline blended price: 7 cache-hit : 2 input : 1 output tokens.
+
+    Since Intelligence Index v5.0.1 the listing no longer carries
+    `price1mBlended7To2To1`, only its parts; this reproduces the model pages'
+    figure exactly. A host with no cache pricing bills cache hits at the full
+    input rate, as AA does.
+    """
+    i = pricing["price_1m_input_tokens"]
+    return (7 * pricing.get("cache_hit_price", i) + 2 * i
+            + pricing["price_1m_output_tokens"]) / 10
+
+
 rows = []
 row_slugs = []
 for slug, m in models.items():
@@ -1022,7 +1036,9 @@ for slug, m in models.items():
     # GPT-5.6 Luna at the pre-cut $1.10/$6.60 against OpenAI's $0.20/$1.20,
     # which medianed to a fictional $0.65/$3.90.
     if quotes := host_pricing[slug]:
-        row.update(min(quotes, key=price_rank))
+        cheapest = min(quotes, key=price_rank)
+        row.update(cheapest)
+        row.setdefault("price_1m_blended", blended_price(cheapest))
     row["num_hosts"] = len(hosts[slug])
     row.update(eqbench_for(m))
     row.update(eqbench4_for(m))
