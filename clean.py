@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Extract model data from the Next.js RSC payload in `providers` and write data.js.
 
-The payload holds ~900 model×host entries. Benchmark scores live on the nested
-"model" object; pricing and speed live on the host entry. Speed is aggregated
-across a model's hosts using the median; pricing is taken from its cheapest
-host (see `price_rank`).
+The payload holds ~500 model×host entries. Benchmark scores live on the nested
+"model" object; pricing and speed live on the host entry. Each entry names
+only its release, so variants are told apart via the release pages. Speed is
+aggregated across a model's hosts using the median; pricing is taken from its
+cheapest host (see `price_rank`).
 """
 import csv
 import glob
@@ -22,9 +23,13 @@ from scipy.optimize import minimize_scalar
 from scipy.special import expit
 
 PROVIDERS_URL = "https://artificialanalysis.ai/leaderboards/providers"
-MODEL_PAGE_URL = "https://artificialanalysis.ai/models/{slug}"
-MODEL_PAGE_CACHE_DIR = "model_pages"
-MODEL_PAGE_FETCH_DELAY = 5.0  # seconds to wait after each live model-page fetch
+RELEASE_PAGE_URL = "https://artificialanalysis.ai/models/{slug}"
+# Not `model_pages/`: that older cache holds one page per model variant from
+# before AA grouped variants into releases, and nothing in a page's text tells
+# the two formats apart, so a variant page cached under a slug that is also a
+# release slug would pass for a release page that lacks its sibling variants.
+RELEASE_PAGE_CACHE_DIR = "release_pages"
+RELEASE_PAGE_FETCH_DELAY = 5.0  # seconds to wait after each live page fetch
 
 USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
               " (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
@@ -90,55 +95,42 @@ def index_version(text):
     return m.group(1) if m else None
 
 
-def fetch_model_page(slug, current_index_version=None):
-    """Return a model's own page payload, fetching once and caching after.
+def fetch_release_page(release_slug, current_index_version=None):
+    """Return a release's page payload, fetching once and caching after.
 
-    Individual model pages carry fields the bulk `providers` listing above has
-    dropped (Coding/Agentic Index, parameter count, legacy price ratios,
-    per-prompt-type breakdowns...). Fetching one per model would hit AA's
-    server far harder than the single bulk request above, so callers only ask
-    for a handful of slugs at a time; anything already cached on disk is
-    reused without a network call, so add more later by dropping a page at
-    `model_pages/<slug>` yourself.
+    The bulk `providers` listing names only each model's release ("claude-
+    sonnet-5-5"), not which effort variant of it a host serves ("claude-
+    sonnet-5-5-high"); the release page lists every variant with its slug
+    and display name, and also carries fields the bulk listing has dropped
+    (Coding/Agentic Index, parameter count, legacy price ratios, per-prompt-
+    type breakdowns...). Pages are cached in `release_pages/<release-slug>`
+    and reused without a network call.
 
     A new Intelligence Index version re-scores every model and changes the
     per-index cost/token fields, so a cached page rendered under a different
     version than `current_index_version` is refetched. None skips that check.
+    Returns None if a needed fetch fails.
     """
-    os.makedirs(MODEL_PAGE_CACHE_DIR, exist_ok=True)
-    path = os.path.join(MODEL_PAGE_CACHE_DIR, slug)
+    os.makedirs(RELEASE_PAGE_CACHE_DIR, exist_ok=True)
+    path = os.path.join(RELEASE_PAGE_CACHE_DIR, release_slug)
     if os.path.exists(path):
         text = open(path).read()
         if current_index_version is None or index_version(text) == current_index_version:
             return text
     try:
-        text = _fetch_rsc(MODEL_PAGE_URL.format(slug=slug))
+        text = _fetch_rsc(RELEASE_PAGE_URL.format(slug=release_slug))
     except Exception as e:
-        print(f"  ! couldn't fetch model page for {slug}: {e}", file=sys.stderr)
+        print(f"  ! couldn't fetch release page for {release_slug}: {e}", file=sys.stderr)
         return None
     if current_index_version is not None and index_version(text) != current_index_version:
         # Otherwise this page would look stale and be refetched on every run.
-        print(f"  ! fresh page for {slug} reports Intelligence Index"
+        print(f"  ! fresh page for {release_slug} reports Intelligence Index"
               f" v{index_version(text)}, listing says v{current_index_version};"
               " update `index_version`", file=sys.stderr)
     with open(path, "w") as f:
         f.write(text)
-    time.sleep(MODEL_PAGE_FETCH_DELAY)
+    time.sleep(RELEASE_PAGE_FETCH_DELAY)
     return text
-
-
-# `--fetch-model <slug> [<slug> ...]` just seeds the model_pages/ cache (for
-# manually growing the enriched set) and exits — it never touches the bulk
-# `providers` listing, unlike a normal run.
-if "--fetch-model" in sys.argv:
-    slugs = sys.argv[sys.argv.index("--fetch-model") + 1:]
-    if not slugs:
-        sys.exit("usage: clean.py --fetch-model <slug> [<slug> ...]")
-    for slug in slugs:
-        print(f"fetching {slug}...")
-        if fetch_model_page(slug):
-            print(f"  cached to {MODEL_PAGE_CACHE_DIR}/{slug}")
-    sys.exit(0)
 
 
 s = fetch_providers()
@@ -238,7 +230,7 @@ def eqbench_for(model):
 # livebench.ai is a JS app whose bundle hard-codes the list of release dates and
 # fetches `table_<date>.csv` / `categories_<date>.json` for the newest one; do
 # the same discovery here. Releases are immutable, so a dated file already on
-# disk is reused without a network call (like `model_pages/`), and loading
+# disk is reused without a network call (like `release_pages/`), and loading
 # globs for the newest local pair so `--cached` / offline runs keep working.
 LIVEBENCH_URL = "https://livebench.ai/"
 
@@ -780,9 +772,9 @@ def enclosing_object(text, i):
 
 
 # The payload holds one entry per model×host. Each entry has a nested `model`
-# (benchmark scores, keyed by `slug`), plus `pricing`, `performance` and
-# `features` sub-objects that vary by host. We aggregate hosts per model slug
-# using the median. `label` is the display name; there is no separate id.
+# (benchmark scores, naming only its `release`), plus `pricing`, `performance`
+# and `features` sub-objects that vary by host. Entries are resolved to a model
+# variant via the release page, and hosts aggregated per variant slug.
 def snake(k):
     """camelCase leaf key -> snake_case (lowercased, digits kept attached)."""
     return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", k).lower()
@@ -833,45 +825,46 @@ def flatten(obj, prefix=""):
 MODEL_PAGE_DUPLICATE_KEYS = {"timescaleData", "endToEndResponseTime", "timeToFirstAnswerToken"}
 
 
-def find_model_object(slug, text):
-    """Richest `"slug":"<slug>"` object found on a model's own page.
+def release_variants(release_slug, text):
+    """A release page's model variants: variant slug -> its richest object.
 
-    The same slug shows up in several shallow stub objects too (e.g. related-
-    model links), so keep whichever match has the most keys.
+    Each variant object names its release (`"release":{"slug":...}`), which
+    sets it apart from the release's own `{"slug","name"}` object; the max-
+    effort variant usually shares the release's slug. A variant also recurs
+    in shallow stubs (chart entries, related-model links), so keep whichever
+    copy has the most keys.
     """
-    best = None
-    for m in re.finditer(rf'"slug":"{re.escape(slug)}"', text):
+    variants = {}
+    for m in re.finditer(rf'"release":\{{"slug":"{re.escape(release_slug)}"', text):
         o = enclosing_object(text, m.start())
-        if isinstance(o, dict) and (best is None or len(o) > len(best)):
-            best = o
-    return best
+        if not (isinstance(o, dict) and o.get("slug") and o.get("shortName")):
+            continue
+        if len(o) > len(variants.get(o["slug"], ())):
+            variants[o["slug"]] = o
+    return variants
 
 
-def model_page_fields(slug, text):
-    """Flatten `find_model_object`'s result, numeric leaves only."""
-    best = find_model_object(slug, text)
-    if not best:
-        return {}
-    trimmed = {k: v for k, v in best.items() if k not in MODEL_PAGE_DUPLICATE_KEYS}
+def model_page_fields(variant):
+    """A release-page variant object's numeric leaves, flattened."""
+    trimmed = {k: v for k, v in variant.items() if k not in MODEL_PAGE_DUPLICATE_KEYS}
     return flatten(trimmed)
 
 
-def load_model_list(text):
-    """The page's full `"models":[...]` roster: slug -> {name, creator, ...}.
+def load_release_list(text):
+    """The page's full `"releases":[...]` roster: slug -> {name, creator, ...}.
 
-    This is broader than the `hostApiId` hits below — it also carries models
-    no host currently reports pricing/performance for (e.g. brand-new
-    releases AA hasn't wired into a provider comparison yet). Those still get
-    a row, sourced entirely from their own model page during enrichment.
+    This is broader than the `hostApiId` hits below — it also carries
+    releases no host currently reports pricing/performance for (e.g. brand-
+    new releases AA hasn't wired into a provider comparison yet). Their
+    variants still get rows, sourced entirely from their release page.
     """
-    i = text.find('"models":[')
+    i = text.find('"releases":[')
     if i == -1:
+        print("  ! no `\"releases\":[` roster in `providers`; models without"
+              " hosts will be missing", file=sys.stderr)
         return {}
-    try:
-        arr = decoder.raw_decode(text, i + len('"models":'))[0]
-    except ValueError:
-        return {}
-    return {m["slug"]: m for m in arr if isinstance(m, dict) and m.get("slug")}
+    arr = decoder.raw_decode(text, i + len('"releases":'))[0]
+    return {r["slug"]: r for r in arr if isinstance(r, dict) and r.get("slug")}
 
 
 # Since Intelligence Index v5 the bulk listing nests benchmark scores under
@@ -944,27 +937,92 @@ def hoist_scores(model):
 # Per-host `performance`/`features` are aggregated by median; `pricing` is kept
 # whole per host and resolved to the cheapest one below.
 HOST_SECTIONS = ("performance", "features")
-models = {}          # slug -> model dict (with `name` injected for matching)
-labels = {}          # slug -> display label
-hosts = defaultdict(set)   # slug -> set of host slugs
-host_pricing = defaultdict(list)   # slug -> one flattened `pricing` per host
-host_data = defaultdict(lambda: defaultdict(list))
+
+# Each host entry's `model` names only its release, shared by all of that
+# release's effort variants (Claude Sonnet 5.5 medium/high/xhigh/max), so
+# group entries by release and resolve variants from the release pages.
+release_entries = defaultdict(list)   # release slug -> its host entries
 for hit in re.finditer(r'"hostApiId":', s):
     o = enclosing_object(s, hit.start())
     if not isinstance(o, dict):
         continue
-    model = o.get("model")
-    if not isinstance(model, dict) or not model.get("slug"):
+    if release := ((o.get("model") or {}).get("release") or {}).get("slug"):
+        release_entries[release].append(o)
+
+# Releases AA lists but no host currently reports pricing/performance for:
+# ones too new to have a provider comparison wired up yet, and deprecated
+# ones (legacy and superseded models), which are kept for comparison since
+# their pages still carry benchmark scores and last-known prices. Their
+# variants get rows sourced entirely from the release page.
+hostless_releases = [r for r in load_release_list(s) if r not in release_entries]
+
+variants_by_release = {}   # release slug -> {variant slug -> variant object}
+for release in [*release_entries, *hostless_releases]:
+    text = fetch_release_page(release, INDEX_VERSION)
+    if text is None:
+        # Without its page a release's variants can't be told apart. Stop
+        # rather than retry or hammer on (`fetch_release_page` printed the
+        # error); pages fetched so far are cached, so a rerun resumes.
+        sys.exit(f"stopping: fetch failed for {release}; data.js left unchanged")
+    variants_by_release[release] = release_variants(release, text)
+
+
+def display_names(variants):
+    """Variant slug -> the name to show: its shortName, unless another shares it.
+
+    AA gives some distinct models the same shortName ("Qwen3 VL 8B" for both
+    the Instruct and the reasoning model, which are separate releases); those
+    fall back to the full `name` ("Qwen3 VL 8B Instruct"), which stays
+    distinct. The grapher keys rows by name, so names must be unique.
+    """
+    counts = Counter(v["shortName"] for v in variants.values())
+    return {slug: v["shortName"] if counts[v["shortName"]] == 1 else v["name"]
+            for slug, v in variants.items()}
+
+
+display_name = display_names({slug: v for variants in variants_by_release.values()
+                              for slug, v in variants.items()})
+
+
+def match_variant(entry, variants):
+    """The variant a host entry serves, or None if no variant fits.
+
+    A host's `label` is the variant's `shortName`, sometimes followed by a
+    host-specific tag ("Qwen3.5 122B A10B (non-reasoning) (FP4)"), so take
+    the longest shortName the label starts with. The reasoning flag must
+    agree too: it separates siblings that share a shortName, and stops a
+    label whose own variant is missing from the page falling back to a
+    sibling ("... (non-reasoning)" onto the reasoning one). A tie that
+    neither settles is ambiguous, so it matches nothing rather than guess.
+    """
+    label = entry.get("label") or ""
+    reasoning = entry["model"].get("reasoningModel")
+    fits = [v for v in variants.values()
+            if v.get("isReasoning") == reasoning
+            and (label == v["shortName"] or label.startswith(v["shortName"] + " "))]
+    longest = max((len(v["shortName"]) for v in fits), default=None)
+    best = [v for v in fits if len(v["shortName"]) == longest]
+    return best[0] if len(best) == 1 else None
+
+
+models = {}          # slug -> model dict (with `name` injected for matching)
+release_of = {}      # variant slug -> release slug
+hosts = defaultdict(set)   # slug -> set of host slugs
+host_pricing = defaultdict(list)   # slug -> one flattened `pricing` per host
+host_data = defaultdict(lambda: defaultdict(list))
+unmatched_labels = []
+for release, o in [(r, o) for r, entries in release_entries.items() for o in entries]:
+    variant = match_variant(o, variants_by_release[release])
+    if variant is None:
+        unmatched_labels.append(o.get("label"))
         continue
-    slug = model["slug"]
-    label = o.get("label")
-    # eqbench/livebench matchers look at slug/name/short_name; the payload only
-    # carries slug, so surface the display label under both name attributes.
-    model = {**hoist_scores(model), "name": label, "short_name": label}
+    slug = variant["slug"]
+    release_of[slug] = release
+    # eqbench/livebench matchers look at slug/name/short_name.
+    model = {**hoist_scores(o["model"]), "slug": slug,
+             "name": display_name[slug], "short_name": variant["shortName"]}
     if slug not in models or len(model) > len(models[slug]):
         models[slug] = model
-    if label and slug not in labels:
-        labels[slug] = label
     # `hostApiId` names the model as that host spells it, not the host itself
     # (every provider serving Kimi K2.6 reports "moonshotai/Kimi-K2.6"), so
     # hosts are counted by `host.slug`. A host can list one model more than
@@ -980,17 +1038,20 @@ for hit in re.finditer(r'"hostApiId":', s):
 if unmapped_scores:
     print(f"  ! no SCORE_KEYS entry for {sorted(unmapped_scores)}; using the"
           " slug as the field name", file=sys.stderr)
+if unmatched_labels:
+    print(f"  ! {len(unmatched_labels)} host entries match no variant on their"
+          f" release page, skipped: {sorted(set(unmatched_labels))}", file=sys.stderr)
 
-# Models AA lists but no host currently reports pricing/performance for (e.g.
-# a release too new to have a provider comparison wired up yet). These get no
-# host-derived fields at all — enrichment below must fetch their own page.
-hostless_slugs = set()
-for slug, m in load_model_list(s).items():
-    if slug in models or m.get("deprecated"):
-        continue
-    models[slug] = {**m, "name": m.get("name"), "short_name": m.get("name")}
-    labels.setdefault(slug, m.get("name"))
-    hostless_slugs.add(slug)
+# Variants no host serves: every variant of a hostless release, plus any
+# sibling of a hosted variant that has no host of its own. These get no
+# host-derived fields; enrichment below fills them from the release page.
+for release, variants in variants_by_release.items():
+    for slug, v in variants.items():
+        if slug in models:
+            continue
+        release_of[slug] = release
+        models[slug] = {"slug": slug, "name": display_name[slug], "short_name": v["shortName"],
+                        "creator": v.get("creator"), "isOpenWeights": v.get("isOpenWeights")}
 
 for m in models.values():
     eff_rank = _EFFORT_RANK[_model_effort(m)]
@@ -1048,85 +1109,22 @@ for slug, m in models.items():
     row.update(simplebench_for(m))
     row.update(eci_for(m))
     row.update(frontiermath_for(m))
-    row["name"] = labels.get(slug) or slug
+    row["name"] = m["name"] or slug
     row["creator"] = (m.get("creator") or {}).get("name", "")
     row["open_weights"] = bool(m.get("isOpenWeights"))
     rows.append(row)
     row_slugs.append(slug)
 
 
-# --- Enrich a handful of models with their individual model-page payload ------
-# Auto-fetch only the models most people actually look at (top TOP_N by
-# Intelligence Index, plus the price/intelligence Pareto frontier); everything
-# else stays on the bulk fields above unless its page is already cached (see
-# `fetch_model_page`). Fields already set from the bulk listing win on overlap
-# since they're aggregated across all of a model's hosts.
-TOP_N = None  # None = no cap, enrich every scored model
-# `--scored-only` fetches pages just for models with a current Intelligence
-# Index score (a quick refresh after an index version bump, instead of the
-# whole cache). Other models keep only pages already cached at the current
-# version: a stale page would hand them its old-version index score.
-SCORED_ONLY = "--scored-only" in sys.argv
-
-
-def page_is_current(slug):
-    """Whether a page is cached for `slug` at the listing's index version."""
-    path = os.path.join(MODEL_PAGE_CACHE_DIR, slug)
-    return os.path.exists(path) and (
-        INDEX_VERSION is None or index_version(open(path).read()) == INDEX_VERSION)
-
-
-def pareto_frontier(items, cost_key, quality_key):
-    """(slug, row) pairs on the min-cost/max-quality skyline."""
-    frontier = []
-    best_quality = float("-inf")
-    for slug, row in sorted(items, key=lambda t: t[1][cost_key]):
-        if row[quality_key] > best_quality:
-            frontier.append(slug)
-            best_quality = row[quality_key]
-    return frontier
-
-
-scored = [(slug, row) for slug, row in zip(row_slugs, rows) if "intelligence_index" in row]
-ranked = sorted(scored, key=lambda t: -t[1]["intelligence_index"])
-top_n = {slug for slug, _ in (ranked if TOP_N is None else ranked[:TOP_N])}
-priced = [(slug, row) for slug, row in scored if "price_1m_blended" in row]
-pareto = set(pareto_frontier(priced, "price_1m_blended", "intelligence_index"))
-# Hostless models have no bulk-listing fields at all (no benchmarks, no
-# `isOpenWeights`), so their page fetch isn't optional the way it is for
-# everyone else — force it regardless of intelligence ranking.
-priority_slugs = top_n | pareto | (set() if SCORED_ONLY else hostless_slugs)
-
-enriched = 0
-skipped_stale = 0
-stopped_early = False
+# --- Enrich every model from its release page ---------------------------------
+# Release pages carry fields the bulk listing has dropped. Fields already set
+# from the bulk listing win on overlap since they're aggregated across all of
+# a model's hosts.
 for slug, row in zip(row_slugs, rows):
-    if slug not in priority_slugs:
-        if SCORED_ONLY and not page_is_current(slug):
-            skipped_stale += os.path.exists(os.path.join(MODEL_PAGE_CACHE_DIR, slug))
-            continue
-        if not os.path.exists(os.path.join(MODEL_PAGE_CACHE_DIR, slug)):
-            continue
-    text = fetch_model_page(slug, INDEX_VERSION)
-    if text is None:
-        # A live fetch failed; stop rather than retry or push on to the next
-        # model (`fetch_model_page` already printed the underlying error).
-        print(f"stopping enrichment: fetch failed for {slug}, not retrying", file=sys.stderr)
-        stopped_early = True
-        break
-    for k, v in model_page_fields(slug, text).items():
+    variant = variants_by_release[release_of[slug]][slug]
+    for k, v in model_page_fields(variant).items():
         row.setdefault(k, v)
-    if slug in hostless_slugs:
-        obj = find_model_object(slug, text) or {}
-        if "isOpenWeights" in obj:
-            row["open_weights"] = bool(obj["isOpenWeights"])
-    enriched += 1
-status = "stopped early" if stopped_early else "done"
-print(f"enriched {enriched} models from individual model pages ({status}; "
-      f"{len(top_n)} top by intelligence, {len(pareto)} price/intelligence pareto)")
-if skipped_stale:
-    print(f"skipped {skipped_stale} models whose cached page predates Intelligence"
-          f" Index v{INDEX_VERSION} (--scored-only)")
+print(f"enriched {len(rows)} models from {len(variants_by_release)} release pages")
 
 counts = Counter(k for r in rows for k in r if k not in ("name", "creator", "open_weights"))
 fields = sorted(counts)
@@ -1191,6 +1189,11 @@ for r in rows:
         if k in r:
             sr[fid] = sig4(r[k])
     short_rows.append(sr)
+
+# An empty DATA renders a blank grapher; keep the last good data.js instead
+# (this is how an upstream payload change shows up).
+if not rows:
+    sys.exit("no models parsed from `providers`; data.js left unchanged")
 
 with open("data.js", "w") as f:
     f.write("const FIELDS = " + json.dumps(field_objects, indent=1) + ";\n")
